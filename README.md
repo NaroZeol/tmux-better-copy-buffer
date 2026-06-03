@@ -61,6 +61,14 @@ Disable automatic bindings if you want to wire commands yourself:
 set -g @better-copy-buffer-bind-keys off
 ```
 
+## Project structure
+
+- `tmux-better-copy-buffer.tmux` is the TPM entrypoint.
+- `scripts/tmux-better-copy-buffer.sh` is the command runner for chooser and paste actions.
+- `scripts/lib/tmux.sh` is the tmux adapter used by runtime code and tests.
+- `run_tests` is the shell E2E harness.
+- `CONTEXT.md` records the project vocabulary for future agents and contributors.
+
 ## Limitations
 
 - MVP supports tmux auto-style buffer names only: `buffer` followed by digits, such as `buffer0001`.
