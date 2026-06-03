@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    name: validate and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tmux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux util-linux
+
+      - name: Check shell syntax
+        run: |
+          sh -n tmux-better-copy-buffer.tmux
+          sh -n scripts/lib/tmux.sh
+          sh -n scripts/tmux-better-copy-buffer.sh
+          sh -n run_tests
+          sh -n tests/tpm_install_e2e
+
+      - name: Run isolated tmux e2e tests
+        run: ./run_tests
+
+      - name: Verify TPM can install this tag
+        run: ./tests/tpm_install_e2e "NaroZeol/tmux-better-copy-buffer#${GITHUB_REF_NAME}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag

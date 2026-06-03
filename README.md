@@ -25,10 +25,22 @@ Then install with TPM:
 prefix + I
 ```
 
+Make sure TPM itself is loaded at the end of `.tmux.conf`:
+
+```tmux
+run '~/.tmux/plugins/tpm/tpm'
+```
+
+Users who want to pin a release can install a tagged version:
+
+```tmux
+set -g @plugin 'NaroZeol/tmux-better-copy-buffer#v0.1.0'
+```
+
 For local development, clone this repository and execute the entrypoint from tmux:
 
 ```sh
-/path/to/tmux-better-copy-buffer/tmux-better-copy-buffer.tmux
+tmux source-file /path/to/tmux-better-copy-buffer/tmux-better-copy-buffer.tmux
 ```
 
 ## Configuration
@@ -67,6 +79,10 @@ set -g @better-copy-buffer-bind-keys off
 - `scripts/tmux-better-copy-buffer.sh` is the command runner for chooser and paste actions.
 - `scripts/lib/tmux.sh` is the tmux adapter used by runtime code and tests.
 - `run_tests` is the shell E2E harness.
+- `tests/tpm_install_e2e` verifies the plugin through TPM's install path.
+- `.github/workflows/e2e.yml` runs syntax checks, isolated tmux tests, and TPM install E2E.
+- `.github/workflows/release.yml` validates `v*` tags and creates GitHub Releases.
+- `docs/RELEASE.md` documents the maintainer release process.
 - `CONTEXT.md` records the project vocabulary for future agents and contributors.
 
 ## Limitations
@@ -84,9 +100,25 @@ Run:
 
 ```sh
 ./run_tests
+./tests/tpm_install_e2e "$PWD"
 ```
 
-The tests are shell-based and start isolated tmux servers. They require `tmux` and `script`.
+The tests are shell-based and start isolated tmux servers. They require `git`,
+`tmux`, and `script`.
+
+The TPM install E2E can also verify the public repository:
+
+```sh
+./tests/tpm_install_e2e NaroZeol/tmux-better-copy-buffer
+```
+
+## CI and releases
+
+Pushes and pull requests run GitHub Actions E2E against tmux and TPM. Pushes to
+`main` also smoke-test installation from the public GitHub repository.
+
+Version tags matching `v*` trigger a release workflow that validates the tagged
+plugin through TPM and creates a GitHub Release. See `docs/RELEASE.md`.
 
 ## License
 

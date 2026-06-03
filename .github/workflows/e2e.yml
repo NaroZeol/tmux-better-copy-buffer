@@ -1,0 +1,40 @@
+name: e2e
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tmux:
+    name: tmux plugin e2e
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install tmux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux util-linux
+
+      - name: Check shell syntax
+        run: |
+          sh -n tmux-better-copy-buffer.tmux
+          sh -n scripts/lib/tmux.sh
+          sh -n scripts/tmux-better-copy-buffer.sh
+          sh -n run_tests
+          sh -n tests/tpm_install_e2e
+
+      - name: Run isolated tmux e2e tests
+        run: ./run_tests
+
+      - name: Run TPM install e2e from this checkout
+        run: ./tests/tpm_install_e2e "$PWD"
+
+      - name: Run TPM install smoke test from public GitHub repository
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: ./tests/tpm_install_e2e NaroZeol/tmux-better-copy-buffer
