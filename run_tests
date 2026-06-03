@@ -1,0 +1,358 @@
+#!/usr/bin/env sh
+set -eu
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$ROOT_DIR/scripts/lib/tmux.sh"
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "not ok - tmux is required" >&2
+  exit 1
+fi
+
+if ! command -v script >/dev/null 2>&1; then
+  echo "not ok - script is required" >&2
+  exit 1
+fi
+
+fail() {
+  echo "not ok - $1" >&2
+  exit 1
+}
+
+assert_eq() {
+  expected=$1
+  actual=$2
+  message=$3
+
+  if [ "$expected" != "$actual" ]; then
+    printf 'not ok - %s\nexpected: %s\nactual:   %s\n' "$message" "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
+assert_contains() {
+  haystack=$1
+  needle=$2
+  message=$3
+
+  case "$haystack" in
+    *"$needle"*) ;;
+    *) printf 'not ok - %s\nmissing: %s\nin:      %s\n' "$message" "$needle" "$haystack" >&2; exit 1 ;;
+  esac
+}
+
+assert_not_contains() {
+  haystack=$1
+  needle=$2
+  message=$3
+
+  case "$haystack" in
+    *"$needle"*) printf 'not ok - %s\nunexpected: %s\nin:         %s\n' "$message" "$needle" "$haystack" >&2; exit 1 ;;
+    *) ;;
+  esac
+}
+
+start_tmux() {
+  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  TMUX_BCB_SOCKET=$sock tmux_bcb_tmux -f /dev/null new-session -d -x 80 -y 24 -s bcb-test
+  printf '%s\n' "$sock"
+}
+
+tmux_test() {
+  sock=$1
+  shift
+  TMUX_BCB_SOCKET=$sock tmux_bcb_tmux "$@"
+}
+
+stop_tmux() {
+  sock=$1
+  tmux_test "$sock" kill-server >/dev/null 2>&1 || true
+}
+
+top_buffer_name() {
+  sock=$1
+  tmux_test "$sock" list-buffers -F '#{buffer_name}' | sed -n '1p'
+}
+
+capture_pane_text() {
+  sock=$1
+  tmux_test "$sock" capture-pane -p -J | tr -d '\r'
+}
+
+start_attached_client() {
+  sock=$1
+  log=${TMPDIR:-/tmp}/tmux-bcb-client.$$.log
+  script -q -c "TERM=xterm-256color tmux -f /dev/null -S $sock new-session -x 80 -y 24 -s bcb-test" "$log" >/dev/null 2>&1 &
+  printf '%s\n' "$!"
+}
+
+wait_for_client() {
+  sock=$1
+  i=0
+  while [ "$i" -lt 50 ]; do
+    client=$(tmux_test "$sock" list-clients -F '#{client_name}' 2>/dev/null | sed -n '1p')
+    if [ "$client" ]; then
+      printf '%s\n' "$client"
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.1
+  done
+  fail "attached tmux client appears"
+}
+
+test_paste_touch_makes_buffer_latest() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-buffer -b buffer0001 'alpha'
+  sleep 1
+  tmux_test "$sock" set-buffer -b buffer0002 'beta'
+
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-touch buffer0001
+
+  pane=$(capture_pane_text "$sock")
+  printf '%s\n' "$pane" | grep -F 'alpha' >/dev/null || fail "paste-touch pasted selected buffer content"
+
+  top=$(top_buffer_name "$sock")
+  assert_eq "buffer0001" "$top" "paste-touch refreshes selected buffer recency"
+
+  content=$(tmux_test "$sock" show-buffer -b buffer0001)
+  assert_eq "alpha" "$content" "paste-touch preserves selected buffer content"
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - paste-touch makes selected buffer latest"
+}
+
+test_paste_touch_preserves_shell_sensitive_content() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  payload=$(printf 'line one\n--leading-dash\t"quoted"; dollar$ backslash\\')
+  tmux_test "$sock" set-buffer -b buffer0001 "$payload"
+
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-touch buffer0001
+
+  content=$(tmux_test "$sock" show-buffer -b buffer0001)
+  assert_eq "$payload" "$content" "paste-touch preserves shell-sensitive buffer content"
+
+  pane=$(capture_pane_text "$sock")
+  assert_contains "$pane" "line one" "shell-sensitive content first line is pasted"
+  assert_contains "$pane" "--leading-dash" "shell-sensitive content second line is pasted"
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - paste-touch preserves shell-sensitive content"
+}
+
+test_prefix_equal_opens_native_buffer_chooser() {
+  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  client_pid=$(start_attached_client "$sock")
+  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+
+  client=$(wait_for_client "$sock")
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  tmux_test "$sock" set-buffer -b buffer0001 'alpha'
+  sleep 1
+  tmux_test "$sock" set-buffer -b buffer0002 'beta'
+  tmux_test "$sock" set-buffer -b named 'explicit'
+
+  tmux_test "$sock" switch-client -c "$client" -T prefix
+  tmux_test "$sock" send-keys -c "$client" -K =
+  sleep 0.5
+
+  mode=$(tmux_test "$sock" display-message -p '#{pane_in_mode}:#{pane_mode}')
+  assert_eq "1:buffer-mode" "$mode" "prefix = opens native buffer chooser"
+
+  tmux_test "$sock" send-keys q >/dev/null 2>&1 || true
+
+  stop_tmux "$sock"
+  wait "$client_pid" >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  echo "ok - prefix = opens native buffer chooser"
+}
+
+test_auto_buffer_filter_excludes_explicit_names() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-buffer -b buffer0001 'alpha'
+  tmux_test "$sock" set-buffer -b named 'explicit'
+  tmux_test "$sock" set-buffer -b buffer123x 'not-auto'
+
+  filtered=$(tmux_test "$sock" list-buffers -F '#{buffer_name}' -f '#{m/r:^buffer[0-9]+$,#{buffer_name}}')
+  assert_contains "$filtered" "buffer0001" "auto buffer filter includes auto buffers"
+  assert_not_contains "$filtered" "named" "auto buffer filter excludes explicit names"
+  assert_not_contains "$filtered" "buffer123x" "auto buffer filter excludes nonnumeric buffer-like names"
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - auto buffer filter excludes explicit names"
+}
+
+test_prefix_bracket_pastes_latest_buffer() {
+  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  client_pid=$(start_attached_client "$sock")
+  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+
+  client=$(wait_for_client "$sock")
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  tmux_test "$sock" set-buffer -b buffer0001 'alpha'
+  sleep 1
+  tmux_test "$sock" set-buffer -b buffer0002 'beta'
+
+  tmux_test "$sock" switch-client -c "$client" -T prefix
+  tmux_test "$sock" send-keys -c "$client" -K ']'
+  sleep 0.5
+
+  pane=$(capture_pane_text "$sock")
+  printf '%s\n' "$pane" | grep -F 'beta' >/dev/null || fail "prefix ] pasted latest buffer content"
+
+  top=$(top_buffer_name "$sock")
+  assert_eq "buffer0002" "$top" "prefix ] keeps latest buffer as top buffer"
+
+  stop_tmux "$sock"
+  wait "$client_pid" >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  echo "ok - prefix ] pastes latest buffer"
+}
+
+test_binding_options_are_respected() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-bind-keys off
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+  default_choose=$(tmux_test "$sock" list-keys -T prefix =)
+  default_paste=$(tmux_test "$sock" list-keys -T prefix ']')
+  assert_not_contains "$default_choose" "tmux-better-copy-buffer.sh" "bind-keys off leaves prefix = unchanged"
+  assert_not_contains "$default_paste" "tmux-better-copy-buffer.sh" "bind-keys off leaves prefix ] unchanged"
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-bind-keys on
+  tmux_test "$sock" set-option -g @better-copy-buffer-choose-key B
+  tmux_test "$sock" set-option -g @better-copy-buffer-paste-key P
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  custom_choose=$(tmux_test "$sock" list-keys -T prefix B)
+  custom_paste=$(tmux_test "$sock" list-keys -T prefix P)
+  assert_contains "$custom_choose" "tmux-better-copy-buffer.sh choose" "custom choose key is bound"
+  assert_contains "$custom_paste" "tmux-better-copy-buffer.sh paste-latest" "custom paste key is bound"
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - binding options are respected"
+}
+
+test_reverse_sort_option_is_respected() {
+  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  client_pid=$(start_attached_client "$sock")
+  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+
+  client=$(wait_for_client "$sock")
+  tmux_test "$sock" set-option -g @better-copy-buffer-reverse-sort on
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  tmux_test "$sock" set-buffer -b buffer0001 'alpha'
+  tmux_test "$sock" set-buffer -b buffer0002 'beta'
+
+  tmux_test "$sock" switch-client -c "$client" -T prefix
+  tmux_test "$sock" send-keys -c "$client" -K =
+  sleep 0.5
+
+  messages=$(tmux_test "$sock" show-messages)
+  assert_contains "$messages" "choose-buffer -r -O time" "reverse sort option passes -r to native chooser"
+
+  tmux_test "$sock" send-keys q >/dev/null 2>&1 || true
+  stop_tmux "$sock"
+  wait "$client_pid" >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  echo "ok - reverse sort option is respected"
+}
+
+test_non_auto_buffer_names_are_rejected() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-buffer -b buffer123x 'not-auto'
+  if TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-touch buffer123x; then
+    fail "non-auto buffer name is rejected"
+  fi
+
+  pane=$(capture_pane_text "$sock")
+  printf '%s\n' "$pane" | grep -F 'not-auto' >/dev/null && fail "rejected buffer was not pasted"
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - non-auto buffer names are rejected"
+}
+
+test_default_display_message_on_binding_failure() {
+  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  client_pid=$(start_attached_client "$sock")
+  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+
+  client=$(wait_for_client "$sock")
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  tmux_test "$sock" switch-client -c "$client" -T prefix
+  tmux_test "$sock" send-keys -c "$client" -K ']'
+  sleep 0.5
+
+  messages=$(tmux_test "$sock" show-messages 2>/dev/null || true)
+  assert_contains "$messages" "tmux-better-copy-buffer: no buffers" "default display messages show binding failure text"
+
+  stop_tmux "$sock"
+  wait "$client_pid" >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  echo "ok - default display message appears on binding failure"
+}
+
+test_display_messages_can_be_disabled() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-display-messages off
+  tmux_test "$sock" set-buffer -b buffer123x 'not-auto'
+
+  if TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-touch buffer123x; then
+    fail "non-auto buffer name is still rejected when messages are disabled"
+  fi
+
+  messages=$(tmux_test "$sock" show-messages 2>/dev/null || true)
+  assert_not_contains "$messages" "unsupported buffer name" "disabled display messages suppress plugin failure text"
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - display messages can be disabled"
+}
+
+test_paste_latest_without_buffers_fails_cleanly() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  if TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-latest; then
+    fail "paste-latest fails when no buffers exist"
+  fi
+
+  pane=$(capture_pane_text "$sock")
+  assert_not_contains "$pane" "tmux-better-copy-buffer" "no-buffer failure does not write command noise into pane"
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - paste-latest without buffers fails cleanly"
+}
+
+test_paste_touch_makes_buffer_latest
+test_paste_touch_preserves_shell_sensitive_content
+test_prefix_equal_opens_native_buffer_chooser
+test_auto_buffer_filter_excludes_explicit_names
+test_prefix_bracket_pastes_latest_buffer
+test_binding_options_are_respected
+test_reverse_sort_option_is_respected
+test_non_auto_buffer_names_are_rejected
+test_default_display_message_on_binding_failure
+test_display_messages_can_be_disabled
+test_paste_latest_without_buffers_fails_cleanly

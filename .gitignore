@@ -1,0 +1,5 @@
+.scratch/
+*.log
+*.tmp
+*.swp
+*~
