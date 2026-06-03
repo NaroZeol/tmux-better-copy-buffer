@@ -87,3 +87,7 @@ Run:
 ```
 
 The tests are shell-based and start isolated tmux servers. They require `tmux` and `script`.
+
+## License
+
+MIT
