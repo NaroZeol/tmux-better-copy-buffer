@@ -48,6 +48,11 @@ set -g @better-copy-buffer-reverse-sort off
 
 # Show plugin status messages on failures. Default: on
 set -g @better-copy-buffer-display-messages on
+
+# How a pasted buffer becomes latest. Default: touch
+# touch: keep the same buffer name and refresh its timestamp.
+# recreate: delete the old buffer and let tmux create a new auto name.
+set -g @better-copy-buffer-recency-strategy touch
 ```
 
 Disable automatic bindings if you want to wire commands yourself:
@@ -62,6 +67,7 @@ set -g @better-copy-buffer-bind-keys off
 - Explicitly named buffers with arbitrary names are rejected by the plugin command.
 - With the default `touch` strategy, last-used ordering is implemented by refreshing tmux's `buffer_created` timestamp after paste.
 - Because of that, tmux's `buffer-limit` eviction order also treats recently used buffers as newer.
+- With `@better-copy-buffer-recency-strategy recreate`, the used buffer gets a new tmux auto name and the old name disappears.
 - The behavior has been tested locally with tmux 3.4.
 
 ## Tests

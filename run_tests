@@ -146,6 +146,59 @@ test_paste_touch_preserves_shell_sensitive_content() {
   echo "ok - paste-touch preserves shell-sensitive content"
 }
 
+test_recreate_strategy_recreates_buffer_with_new_auto_name() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-recency-strategy recreate
+  tmux_test "$sock" set-buffer -b buffer0001 'alpha'
+  sleep 1
+  tmux_test "$sock" set-buffer -b buffer0002 'beta'
+
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-touch buffer0001
+
+  top=$(top_buffer_name "$sock")
+  if [ "$top" = "buffer0001" ]; then
+    fail "recreate strategy gives used buffer a new auto name"
+  fi
+
+  top_content=$(tmux_test "$sock" show-buffer -b "$top")
+  assert_eq "alpha" "$top_content" "recreate strategy preserves used buffer content under new name"
+
+  buffers=$(tmux_test "$sock" list-buffers -F '#{buffer_name}')
+  assert_not_contains "$buffers" "buffer0001" "recreate strategy removes old buffer name"
+  assert_contains "$buffers" "buffer0002" "recreate strategy keeps other buffers"
+
+  pane=$(capture_pane_text "$sock")
+  assert_contains "$pane" "alpha" "recreate strategy pastes selected buffer content"
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - recreate strategy recreates buffer with new auto name"
+}
+
+test_invalid_recency_strategy_fails_before_paste() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-recency-strategy invalid
+  tmux_test "$sock" set-buffer -b buffer0001 'alpha'
+
+  if TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-touch buffer0001; then
+    fail "invalid recency strategy is rejected"
+  fi
+
+  pane=$(capture_pane_text "$sock")
+  assert_not_contains "$pane" "alpha" "invalid recency strategy does not paste buffer content"
+
+  content=$(tmux_test "$sock" show-buffer -b buffer0001)
+  assert_eq "alpha" "$content" "invalid recency strategy preserves original buffer"
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - invalid recency strategy fails before paste"
+}
+
 test_prefix_equal_opens_native_buffer_chooser() {
   sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
   client_pid=$(start_attached_client "$sock")
@@ -347,6 +400,8 @@ test_paste_latest_without_buffers_fails_cleanly() {
 
 test_paste_touch_makes_buffer_latest
 test_paste_touch_preserves_shell_sensitive_content
+test_recreate_strategy_recreates_buffer_with_new_auto_name
+test_invalid_recency_strategy_fails_before_paste
 test_prefix_equal_opens_native_buffer_chooser
 test_auto_buffer_filter_excludes_explicit_names
 test_prefix_bracket_pastes_latest_buffer

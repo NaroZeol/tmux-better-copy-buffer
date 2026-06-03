@@ -20,18 +20,36 @@ is_auto_buffer_name() {
 
 paste_touch() {
   buffer=${1:-}
+  strategy=$(tmux_bcb_option "@better-copy-buffer-recency-strategy" "touch")
 
   if ! is_auto_buffer_name "$buffer"; then
     tmux_bcb_message "tmux-better-copy-buffer: unsupported buffer name: $buffer"
     return 2
   fi
 
+  case $strategy in
+    touch | recreate) ;;
+    *)
+      tmux_bcb_message "tmux-better-copy-buffer: unsupported recency strategy: $strategy"
+      return 2
+      ;;
+  esac
+
   tmp=$(mktemp "${TMPDIR:-/tmp}/tmux-better-copy-buffer.XXXXXX")
   trap 'rm -f "$tmp"' EXIT HUP INT TERM
 
   tmux_bcb_tmux save-buffer -b "$buffer" "$tmp"
   tmux_bcb_tmux paste-buffer -b "$buffer"
-  tmux_bcb_tmux load-buffer -b "$buffer" "$tmp"
+
+  case $strategy in
+    touch)
+      tmux_bcb_tmux load-buffer -b "$buffer" "$tmp"
+      ;;
+    recreate)
+      tmux_bcb_tmux load-buffer "$tmp"
+      tmux_bcb_tmux delete-buffer -b "$buffer"
+      ;;
+  esac
 }
 
 choose_buffer() {
