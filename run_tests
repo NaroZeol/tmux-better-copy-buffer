@@ -52,8 +52,376 @@ assert_not_contains() {
   esac
 }
 
+assert_has_line() {
+  haystack=$1
+  expected=$2
+  message=$3
+
+  if printf '%s\n' "$haystack" | awk -v expected="$expected" '$0 == expected { found = 1 } END { exit found ? 0 : 1 }'; then
+    :
+  else
+    printf 'not ok - %s\nmissing line: %s\nin:           %s\n' "$message" "$expected" "$haystack" >&2
+    exit 1
+  fi
+}
+
+make_target_pane_fake_tmux() {
+  dir=$1
+  log=$2
+
+  cat >"$dir/tmux" <<'SH'
+#!/usr/bin/env sh
+if [ "${1:-}" = "-S" ]; then
+  shift 2
+fi
+
+printf '%s\n' "$*" >> "$TMUX_BCB_FAKE_TMUX_LOG"
+
+case ${1:-} in
+  show-option)
+    case ${3:-} in
+      @better-copy-buffer-ui) printf '%s\n' "tui" ;;
+      @better-copy-buffer-tui-preview) printf '%s\n' "on" ;;
+      @better-copy-buffer-tui-layout) ;;
+      @better-copy-buffer-pins-db) printf '%s\n' "/tmp/tmux-bcb-pins.sqlite3" ;;
+      @better-copy-buffer-display-messages) printf '%s\n' "on" ;;
+      status-style) printf '%s\n' "fg=colour7,bg=colour2" ;;
+      *) ;;
+    esac
+    ;;
+  bind-key | set-option)
+    ;;
+  list-buffers)
+    printf '%s\n' "100	buffer0001	alpha"
+    ;;
+  save-buffer)
+    file=
+    for arg do
+      file=$arg
+    done
+    printf '%s\n' "alpha" >"$file"
+    ;;
+  paste-buffer | load-buffer | delete-buffer | choose-buffer | display-message)
+    ;;
+  *)
+    printf '%s\n' "unexpected tmux command: $*" >&2
+    exit 64
+    ;;
+esac
+SH
+  chmod +x "$dir/tmux"
+  : >"$log"
+}
+
+make_fake_tui() {
+  dir=$1
+cat > "$dir/tui" <<'SH'
+#!/usr/bin/env sh
+: > "$TMUX_BCB_FAKE_TUI_ARGS"
+for arg do
+  printf '%s\n' "$arg" >> "$TMUX_BCB_FAKE_TUI_ARGS"
+done
+if [ "${TMUX_BCB_FAKE_TUI_STATUS_STYLE:-}" ]; then
+  printf '%s\n' "${TMUX_BCB_STATUS_STYLE:-}" > "$TMUX_BCB_FAKE_TUI_STATUS_STYLE"
+fi
+SH
+  chmod +x "$dir/tui"
+}
+
+test_tui_popup_binding_passes_current_pane_to_choose_tui() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-target-pane.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+
+  log="$tmpdir/tmux.log"
+  make_target_pane_fake_tmux "$tmpdir" "$log"
+
+  PATH="$tmpdir:$PATH" TMUX_BCB_SOCKET=fake TMUX_BCB_FAKE_TMUX_LOG="$log" "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  output=$(cat "$log")
+  assert_contains "$output" "bind-key = run-shell -b -C display-popup" "TUI binding expands pane format before opening popup"
+  assert_contains "$output" "-e TMUX_BCB_TARGET=#{pane_id}" "TUI binding passes invoking pane id through popup environment"
+  assert_contains "$output" "-e TMUX_BCB_STATUS_STYLE=#{status-style}" "TUI binding passes status style through popup environment"
+  assert_contains "$output" "-e TMUX_BCB_TUI_LAYOUT=#{@better-copy-buffer-tui-layout}" "TUI binding passes persisted layout through popup environment"
+  assert_contains "$output" "scripts/tui.py" "TUI binding starts the Python TUI directly"
+  assert_contains "$output" "25l" "TUI binding hides the cursor before Python starts"
+  assert_contains "$output" "trap" "TUI binding registers cursor restore on popup exit"
+  assert_contains "$output" "25h" "TUI binding restores the cursor when popup exits"
+  assert_not_contains "$output" "choose-tui" "TUI binding avoids the choose-tui wrapper on startup"
+
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - TUI popup binding starts fast path with current pane"
+}
+
+test_paste_touch_uses_target_pane_when_provided() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-target-pane.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+
+  log="$tmpdir/tmux.log"
+  make_target_pane_fake_tmux "$tmpdir" "$log"
+
+  PATH="$tmpdir:$PATH" TMUX_BCB_SOCKET=fake TMUX_BCB_FAKE_TMUX_LOG="$log" "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-touch buffer0001 %1
+
+  assert_has_line "$(cat "$log")" "paste-buffer -t %1 -b buffer0001" "paste-touch targets the invoking pane"
+  if awk '
+    /paste-buffer -t %1 -b buffer0001/ { paste = NR }
+    /save-buffer -b buffer0001/ { save = NR }
+    END { exit paste && save && paste < save ? 0 : 1 }
+  ' "$log"; then
+    :
+  else
+    printf 'not ok - paste-touch pastes before recency refresh\nlog:\n%s\n' "$(cat "$log")" >&2
+    exit 1
+  fi
+
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - paste-touch uses target pane when provided"
+}
+
+test_paste_text_file_pastes_arbitrary_text() {
+  sock=$(start_tmux)
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-pin-paste.XXXXXX")
+  trap 'rm -rf "$tmpdir"; stop_tmux "$sock"' EXIT HUP INT TERM
+
+  payload=$(printf 'pinned line one\nsecond line with "quotes" and $dollar')
+  printf '%s' "$payload" >"$tmpdir/pin.txt"
+  target_pane=$(tmux_test "$sock" display-message -p '#{pane_id}')
+
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-text-file "$tmpdir/pin.txt" "$target_pane"
+
+  pane=$(capture_pane_text "$sock")
+  assert_contains "$pane" "pinned line one" "paste-text-file pastes the first line"
+  assert_contains "$pane" 'second line with "quotes" and $dollar' "paste-text-file pastes shell-sensitive text"
+
+  buffers=$(tmux_test "$sock" list-buffers -F '#{buffer_name}')
+  assert_not_contains "$buffers" "tmux-bcb-pin" "paste-text-file deletes its temporary buffer"
+
+  top_buffer=$(tmux_test "$sock" list-buffers -F '#{buffer_name}' -f '#{m/r:^buffer[0-9]+$,#{buffer_name}}' 2>/dev/null | sed -n '1p' || true)
+  if [ -z "$top_buffer" ]; then
+    fail "paste-text-file inserts pin text into a normal auto buffer"
+  fi
+  top_content=$(tmux_test "$sock" show-buffer -b "$top_buffer")
+  assert_eq "$payload" "$top_content" "paste-text-file inserts pin text into a normal auto buffer"
+
+  stop_tmux "$sock"
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - paste-text-file pastes arbitrary text"
+}
+
+test_paste_text_file_adds_auto_buffer_without_deduplicating_existing() {
+  sock=$(start_tmux)
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-pin-paste-existing.XXXXXX")
+  trap 'rm -rf "$tmpdir"; stop_tmux "$sock"' EXIT HUP INT TERM
+
+  payload='shared pinned phrase'
+  tmux_test "$sock" set-buffer -b buffer0001 "$payload"
+  tmux_test "$sock" set-buffer -b buffer0002 'other buffer'
+  printf '%s' "$payload" >"$tmpdir/pin.txt"
+  target_pane=$(tmux_test "$sock" display-message -p '#{pane_id}')
+
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-text-file "$tmpdir/pin.txt" "$target_pane"
+
+  top_buffer=$(tmux_test "$sock" list-buffers -F '#{buffer_name}' | sed -n '1p')
+  top_content=$(tmux_test "$sock" show-buffer -b "$top_buffer")
+  assert_eq "$payload" "$top_content" "pin paste inserts a new latest auto buffer"
+
+  buffers=$(tmux_test "$sock" list-buffers -F '#{buffer_name}')
+  assert_contains "$buffers" "buffer0001" "pin paste keeps existing duplicate auto buffer in place"
+  assert_contains "$buffers" "buffer0002" "pin paste keeps other auto buffers in place"
+  assert_not_contains "$buffers" "tmux-bcb-pin" "temporary pin buffer is deleted after paste"
+
+  stop_tmux "$sock"
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - paste-text-file adds auto buffer without deduplicating existing"
+}
+
+test_choose_tui_passes_target_pane_to_program() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-target-pane.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+
+  log="$tmpdir/tmux.log"
+  make_target_pane_fake_tmux "$tmpdir" "$log"
+  make_fake_tui "$tmpdir"
+
+  PATH="$tmpdir:$PATH" \
+    TMUX_BCB_SOCKET=fake \
+    TMUX_BCB_FAKE_TMUX_LOG="$log" \
+    TMUX_BCB_TUI="$tmpdir/tui" \
+    TMUX_BCB_FAKE_TUI_ARGS="$tmpdir/tui.args" \
+    TMUX_BCB_FAKE_TUI_STATUS_STYLE="$tmpdir/status-style" \
+    "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" choose-tui %1
+
+  assert_has_line "$(cat "$tmpdir/tui.args")" "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" "choose-tui passes script path to the TUI"
+  assert_has_line "$(cat "$tmpdir/tui.args")" "%1" "choose-tui passes target pane to the TUI"
+  assert_has_line "$(cat "$tmpdir/tui.args")" "on" "choose-tui passes preview default to the TUI"
+  assert_has_line "$(cat "$tmpdir/tui.args")" "/tmp/tmux-bcb-pins.sqlite3" "choose-tui passes pins database path to the TUI"
+  assert_has_line "$(cat "$tmpdir/tui.args")" "both" "choose-tui passes persisted layout to the TUI"
+  assert_eq "fg=colour7,bg=colour2" "$(cat "$tmpdir/status-style")" "choose-tui passes status style to the TUI environment"
+  assert_not_contains "$(cat "$log")" "list-buffers" "choose-tui does not pre-load buffers before starting the TUI"
+
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - choose-tui passes target pane to program"
+}
+
+test_set_tui_layout_persists_tmux_option() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-layout.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+
+  log="$tmpdir/tmux.log"
+  make_target_pane_fake_tmux "$tmpdir" "$log"
+
+  PATH="$tmpdir:$PATH" \
+    TMUX_BCB_SOCKET=fake \
+    TMUX_BCB_FAKE_TMUX_LOG="$log" \
+    "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" set-tui-layout pins
+
+  assert_has_line "$(cat "$log")" "set-option -gq @better-copy-buffer-tui-layout pins" "set-tui-layout persists layout in tmux"
+
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - set-tui-layout persists tmux option"
+}
+
+test_choose_tui_starts_python_without_curses_probe() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-python-start.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+
+  log="$tmpdir/tmux.log"
+  make_target_pane_fake_tmux "$tmpdir" "$log"
+  cat >"$tmpdir/python" <<'SH'
+#!/usr/bin/env sh
+: > "$TMUX_BCB_FAKE_PYTHON_ARGS"
+for arg do
+  printf '%s\n' "$arg" >> "$TMUX_BCB_FAKE_PYTHON_ARGS"
+done
+SH
+  chmod +x "$tmpdir/python"
+
+  PATH="$tmpdir:$PATH" \
+    TMUX_BCB_SOCKET=fake \
+    TMUX_BCB_FAKE_TMUX_LOG="$log" \
+    TMUX_BCB_PYTHON="$tmpdir/python" \
+    TMUX_BCB_FAKE_PYTHON_ARGS="$tmpdir/python.args" \
+    "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" choose-tui %1
+
+  python_args=$(cat "$tmpdir/python.args")
+  if printf '%s\n' "$python_args" | awk '$0 == "-c" { found = 1 } END { exit found ? 0 : 1 }'; then
+    fail "choose-tui does not start Python only to probe curses"
+  fi
+  assert_contains "$python_args" "scripts/tui.py" "choose-tui starts the TUI Python program"
+
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - choose-tui starts Python without curses probe"
+}
+
+test_choose_tui_missing_python_fallback_targets_pane() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-target-pane.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+
+  log="$tmpdir/tmux.log"
+  make_target_pane_fake_tmux "$tmpdir" "$log"
+
+  PATH="$tmpdir:$PATH" \
+    TMUX_BCB_SOCKET=fake \
+    TMUX_BCB_FAKE_TMUX_LOG="$log" \
+    TMUX_BCB_PYTHON="$tmpdir/missing-python" \
+    "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" choose-tui %1
+
+  output=$(cat "$log")
+  assert_contains "$output" "choose-buffer -t %1" "missing Python fallback targets native chooser pane"
+  assert_contains "$output" "paste-touch %% %1" "missing Python fallback passes target pane to paste-touch callback"
+
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - choose-tui missing Python fallback targets pane"
+}
+
+test_list_tui_rows_returns_list_buffers_failure() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-fake-tmux.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+
+  cat >"$tmpdir/tmux" <<'SH'
+#!/usr/bin/env sh
+if [ "${1:-}" = "-S" ]; then
+  shift 2
+fi
+
+case ${1:-} in
+  list-buffers)
+    printf '%s\n' "forced list-buffers failure" >&2
+    exit 42
+    ;;
+  *)
+    printf '%s\n' "unexpected tmux command: $*" >&2
+    exit 64
+    ;;
+esac
+SH
+  chmod +x "$tmpdir/tmux"
+
+  set +e
+  PATH="$tmpdir:$PATH" TMUX_BCB_SOCKET=fake "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" list-tui-rows >"$tmpdir/output" 2>"$tmpdir/error"
+  status=$?
+  set -e
+
+  assert_eq "42" "$status" "list-tui-rows returns tmux list-buffers failure status"
+  assert_contains "$(cat "$tmpdir/error")" "forced list-buffers failure" "list-tui-rows preserves tmux failure output"
+
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - list-tui-rows returns list-buffers failure"
+}
+
+test_list_tui_rows_sorts_newest_first() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-fake-tmux.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+
+  cat >"$tmpdir/tmux" <<'SH'
+#!/usr/bin/env sh
+if [ "${1:-}" = "-S" ]; then
+  shift 2
+fi
+
+case ${1:-} in
+  list-buffers)
+    printf '%s\n' "100	buffer0001	older"
+    printf '%s\n' "200	buffer0002	newer"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+SH
+  chmod +x "$tmpdir/tmux"
+
+  rows=$(PATH="$tmpdir:$PATH" TMUX_BCB_SOCKET=fake "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" list-tui-rows)
+  first=$(printf '%s\n' "$rows" | sed -n '1p')
+  assert_eq "200	buffer0002	newer" "$first" "TUI rows put newest buffer first"
+
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - TUI rows sort newest first"
+}
+
+tmux_socket_dir() {
+  if [ -d /private/tmp ] && [ -w /private/tmp ]; then
+    printf '%s\n' /private/tmp
+  else
+    printf '%s\n' "${TMPDIR:-/tmp}"
+  fi
+}
+
+new_tmux_socket() {
+  mktemp -u "$(tmux_socket_dir)/tmux-bcb-test.XXXXXX"
+}
+
 start_tmux() {
-  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  sock=$(new_tmux_socket)
   TMUX_BCB_SOCKET=$sock tmux_bcb_tmux -f /dev/null new-session -d -x 80 -y 24 -s bcb-test
   printf '%s\n' "$sock"
 }
@@ -82,7 +450,11 @@ capture_pane_text() {
 start_attached_client() {
   sock=$1
   log=${TMPDIR:-/tmp}/tmux-bcb-client.$$.log
-  script -q -c "TERM=xterm-256color tmux -f /dev/null -S $sock new-session -x 80 -y 24 -s bcb-test" "$log" >/dev/null 2>&1 &
+  if script -q -c true /dev/null >/dev/null 2>&1; then
+    sleep 1000 | script -q -c "TERM=xterm-256color tmux -f /dev/null -S $sock new-session -x 80 -y 24 -s bcb-test" "$log" >/dev/null 2>&1 &
+  else
+    sleep 1000 | script -q "$log" env TERM=xterm-256color tmux -f /dev/null -S "$sock" new-session -x 80 -y 24 -s bcb-test >/dev/null 2>&1 &
+  fi
   printf '%s\n' "$!"
 }
 
@@ -200,13 +572,18 @@ test_invalid_recency_strategy_fails_before_paste() {
 }
 
 test_prefix_equal_opens_native_buffer_chooser() {
-  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  sock=$(new_tmux_socket)
   client_pid=$(start_attached_client "$sock")
   trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
 
   client=$(wait_for_client "$sock")
+  tmux_test "$sock" set-option -g @better-copy-buffer-ui native
   TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
 
+  chooser_pane=$(tmux_test "$sock" display-message -p '#{pane_id}')
+  tmux_test "$sock" respawn-pane -k -t "$chooser_pane" "sleep 1000"
+  tmux_test "$sock" split-window -h "sleep 1000"
+  tmux_test "$sock" select-pane -t "$chooser_pane"
   tmux_test "$sock" set-buffer -b buffer0001 'alpha'
   sleep 1
   tmux_test "$sock" set-buffer -b buffer0002 'beta'
@@ -216,8 +593,8 @@ test_prefix_equal_opens_native_buffer_chooser() {
   tmux_test "$sock" send-keys -c "$client" -K =
   sleep 0.5
 
-  mode=$(tmux_test "$sock" display-message -p '#{pane_in_mode}:#{pane_mode}')
-  assert_eq "1:buffer-mode" "$mode" "prefix = opens native buffer chooser"
+  mode=$(tmux_test "$sock" display-message -p -t "$chooser_pane" '#{window_zoomed_flag}:#{pane_in_mode}:#{pane_mode}')
+  assert_eq "0:1:buffer-mode" "$mode" "prefix = opens native buffer chooser without zoom by default"
 
   tmux_test "$sock" send-keys q >/dev/null 2>&1 || true
 
@@ -225,6 +602,38 @@ test_prefix_equal_opens_native_buffer_chooser() {
   wait "$client_pid" >/dev/null 2>&1 || true
   trap - EXIT HUP INT TERM
   echo "ok - prefix = opens native buffer chooser"
+}
+
+test_chooser_selection_does_not_send_enter_before_paste() {
+  sock=$(new_tmux_socket)
+  client_pid=$(start_attached_client "$sock")
+  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+
+  client=$(wait_for_client "$sock")
+  tmux_test "$sock" set-option -g @better-copy-buffer-ui native
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  target_pane=$(tmux_test "$sock" display-message -p '#{pane_id}')
+  tmux_test "$sock" respawn-pane -k -t "$target_pane" "env PS1='PROMPT> ' sh -i"
+  sleep 0.5
+  tmux_test "$sock" send-keys -c "$client" C-l
+  sleep 0.2
+  tmux_test "$sock" set-buffer -b buffer0001 'hello'
+
+  tmux_test "$sock" switch-client -c "$client" -T prefix
+  tmux_test "$sock" send-keys -c "$client" -K =
+  sleep 0.5
+  tmux_test "$sock" send-keys -c "$client" Enter
+  sleep 0.5
+
+  pane=$(capture_pane_text "$sock")
+  assert_contains "$pane" "PROMPT> hello" "chooser selection pastes content at the active prompt"
+  assert_not_contains "$pane" "PROMPT> PROMPT> hello" "chooser selection does not send Enter before pasted content"
+
+  stop_tmux "$sock"
+  wait "$client_pid" >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  echo "ok - chooser selection does not send Enter before paste"
 }
 
 test_auto_buffer_filter_excludes_explicit_names() {
@@ -246,7 +655,7 @@ test_auto_buffer_filter_excludes_explicit_names() {
 }
 
 test_prefix_bracket_pastes_latest_buffer() {
-  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  sock=$(new_tmux_socket)
   client_pid=$(start_attached_client "$sock")
   trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
 
@@ -259,7 +668,7 @@ test_prefix_bracket_pastes_latest_buffer() {
 
   tmux_test "$sock" switch-client -c "$client" -T prefix
   tmux_test "$sock" send-keys -c "$client" -K ']'
-  sleep 0.5
+  sleep 1
 
   pane=$(capture_pane_text "$sock")
   printf '%s\n' "$pane" | grep -F 'beta' >/dev/null || fail "prefix ] pasted latest buffer content"
@@ -271,6 +680,1577 @@ test_prefix_bracket_pastes_latest_buffer() {
   wait "$client_pid" >/dev/null 2>&1 || true
   trap - EXIT HUP INT TERM
   echo "ok - prefix ] pastes latest buffer"
+}
+
+test_tui_rows_preserve_buffer_ids_and_samples() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-buffer -b buffer0001 'alpha line'
+  tmux_test "$sock" set-buffer -b buffer0002 "$(printf 'beta\twith tab')"
+  tmux_test "$sock" set-buffer -b named 'explicit'
+
+  rows=$(TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" list-tui-rows)
+
+  assert_contains "$rows" "	buffer0001	alpha line" "TUI row keeps hidden buffer id and visible sample"
+  assert_contains "$rows" "	buffer0002	beta    with tab" "TUI row normalizes sample tabs exactly"
+  assert_not_contains "$rows" "named" "TUI rows exclude explicit names"
+
+  preview=$(TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" preview buffer0001)
+  assert_eq "alpha line" "$preview" "preview shows selected buffer content"
+
+  if TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" preview named >/dev/null 2>&1; then
+    fail "preview rejects explicit buffer names"
+  fi
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - TUI rows preserve buffer ids and samples"
+}
+
+test_tui_chrome_hides_pane_labels() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+import unicodedata
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+def cell_width(value):
+    total = 0
+    for char in value:
+        if unicodedata.combining(char):
+            continue
+        total += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+    return total
+
+
+class FakeScreen:
+    def __init__(self):
+        self.strings = []
+        self.cells = []
+
+    def erase(self):
+        self.strings = []
+        self.cells = []
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        self.strings.append(value)
+        self.cells.append((y, x, value))
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+screen = FakeScreen()
+app = module.App(screen, "/bin/false", "%1", "on")
+app.rows = [module.Row("1", "buffer0001", "汉" * 40)]
+app.preview_cache["buffer0001"] = "content text"
+app.pins = [module.Pin(1, "saved phrase", 1, 1, None)]
+app.draw()
+
+rendered = "\n".join(screen.strings)
+for forbidden in ("copy-buffer>", " buffer ", " preview ", " pins "):
+    if forbidden in rendered:
+        raise SystemExit(f"visible TUI text still contains {forbidden!r}: {rendered!r}")
+selected_rows = [value for y, x, value in screen.cells if x == 0 and value.startswith("> ")]
+if not selected_rows:
+    raise SystemExit(f"selected row was not rendered: {screen.cells!r}")
+if not any(y == 0 and value.startswith("> ") for y, x, value in screen.cells):
+    raise SystemExit(f"buffer rows should start at the top when labels are hidden: {screen.cells!r}")
+if cell_width(selected_rows[0]) > 39:
+    raise SystemExit(f"selected row crosses preview boundary: {selected_rows[0]!r}")
+
+app.mode = "search"
+app.query = "abc"
+app.draw()
+bottom_line = "\n".join(value for y, x, value in screen.cells if y in (10, 11))
+top_line = "\n".join(value for y, x, value in screen.cells if y == 0)
+if "/abc" not in bottom_line:
+    raise SystemExit(f"search prompt is not rendered at the bottom: {screen.cells!r}")
+if "search>" in top_line or "/abc" in top_line:
+    raise SystemExit(f"search prompt should not render at the top: {screen.cells!r}")
+PY
+  echo "ok - TUI chrome hides pane labels"
+}
+
+test_tui_does_not_use_reverse_video() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class FakeScreen:
+    def __init__(self):
+        self.cells = []
+
+    def erase(self):
+        self.cells = []
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        attr = args[0] if args else 0
+        self.cells.append((y, x, value, attr))
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+def assert_no_reverse(cells, message):
+    reversed_cells = [
+        (y, x, value, attr)
+        for y, x, value, attr in cells
+        if attr & module.curses.A_REVERSE
+    ]
+    if reversed_cells:
+        raise SystemExit(f"{message}: {reversed_cells!r}")
+
+
+screen = FakeScreen()
+app = module.App(screen, "false", "%1", "on")
+app.rows = [module.Row("1", "buffer0001", "buffer sample")]
+app.preview_cache["buffer0001"] = "buffer preview"
+app.pins = [module.Pin(1, "pin one", 1, 1, None)]
+
+app.draw()
+assert_no_reverse(screen.cells, "normal buffer view should not use reverse video")
+if not any(value.startswith("> ") for y, x, value, attr in screen.cells):
+    raise SystemExit(f"selected marker should remain visible: {screen.cells!r}")
+
+app.focus = "pins"
+screen.erase()
+app.draw()
+assert_no_reverse(screen.cells, "pin focus view should not use reverse video")
+if not any(value.startswith("> ") and "pin one" in value for y, x, value, attr in screen.cells):
+    raise SystemExit(f"selected pin marker should remain visible: {screen.cells!r}")
+
+app.mode = "search"
+app.query = "needle"
+screen.erase()
+app.draw()
+assert_no_reverse(screen.cells, "search prompt should not use reverse video")
+PY
+  echo "ok - TUI does not use reverse video"
+}
+
+test_tui_selected_rows_use_status_background() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+import unicodedata
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+def cell_width(value):
+    total = 0
+    for char in value:
+        if unicodedata.combining(char):
+            continue
+        total += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+    return total
+
+
+class FakeScreen:
+    def __init__(self):
+        self.cells = []
+
+    def erase(self):
+        self.cells = []
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        attr = args[0] if args else 0
+        self.cells.append((y, x, value, attr))
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+screen = FakeScreen()
+app = module.App(screen, "false", "%1", "on")
+app.rows = [
+    module.Row("2", "buffer0002", "beta"),
+    module.Row("1", "buffer0001", "汉" * 40),
+]
+app.preview_cache["buffer0002"] = "buffer preview"
+app.pins = [module.Pin(1, "pin one", 1, 1, None)]
+app.option_attr = 73
+app.draw()
+
+buffer_rows = [(value, attr) for y, x, value, attr in screen.cells if x == 0 and value.startswith(("> ", "  "))]
+if len(buffer_rows) < 2:
+    raise SystemExit(f"buffer option rows should render: {screen.cells!r}")
+selected_attr = 73 | module.curses.A_BOLD
+selected_buffer, inactive_buffer = buffer_rows[:2]
+if selected_buffer[1] != selected_attr:
+    raise SystemExit(f"selected buffer row should use status background and bold attrs, got {selected_buffer!r}")
+if inactive_buffer[1] != 0:
+    raise SystemExit(f"inactive buffer row should not use status background attr, got {inactive_buffer!r}")
+if cell_width(selected_buffer[0]) != 39:
+    raise SystemExit(f"selected buffer row should fill list width 39, got {cell_width(selected_buffer[0])} for {selected_buffer[0]!r}")
+
+app.focus = "pins"
+screen.erase()
+app.draw()
+pin_rows = [
+    (value, attr)
+    for y, x, value, attr in screen.cells
+    if x >= 40 and value.startswith(("> ", "  ")) and "pin one" in value
+]
+if not pin_rows:
+    raise SystemExit(f"pin option row should render: {screen.cells!r}")
+for value, attr in pin_rows:
+    if attr != selected_attr:
+        raise SystemExit(f"selected pin row should use status background and bold attrs, got {(value, attr)!r}")
+    if cell_width(value) != 40:
+        raise SystemExit(f"selected pin row should fill preview width 40, got {cell_width(value)} for {value!r}")
+
+pairs = []
+module.curses.has_colors = lambda: True
+module.curses.COLORS = 256
+module.curses.init_pair = lambda pair, fg, bg: pairs.append((pair, fg, bg))
+module.curses.color_pair = lambda pair: pair * 1000
+
+styled = module.App(screen, "false", "%1", "off")
+styled.status_style = "fg=colour0,bg=colour2"
+styled.init_option_style()
+if pairs != [(1, 231, 2)]:
+    raise SystemExit(f"dark status bg should initialize a pure contrasting curses color pair, got {pairs!r}")
+if styled.option_attr != 1000:
+    raise SystemExit(f"option_attr should use initialized color pair, got {styled.option_attr!r}")
+
+pairs.clear()
+light = module.App(screen, "false", "%1", "off")
+light.status_style = "fg=colour7,bg=colour208"
+light.init_option_style()
+if pairs != [(1, 16, 208)]:
+    raise SystemExit(f"orange status bg should initialize a pure black foreground pair, got {pairs!r}")
+
+pairs.clear()
+divider = module.App(screen, "false", "%1", "off")
+divider.init_divider_style()
+if pairs != [(2, 231, -1)]:
+    raise SystemExit(f"divider should initialize a pure white foreground pair, got {pairs!r}")
+if divider.divider_attr != 2000:
+    raise SystemExit(f"divider_attr should use initialized white color pair, got {divider.divider_attr!r}")
+PY
+  echo "ok - TUI selected rows use status background with contrast foreground"
+}
+
+test_tui_help_command_replaces_default_key_hints() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+import unicodedata
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+def cell_width(value):
+    total = 0
+    for char in value:
+        if unicodedata.combining(char):
+            continue
+        total += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+    return total
+
+
+class FakeScreen:
+    def __init__(self):
+        self.cells = []
+
+    def erase(self):
+        self.cells = []
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        attr = args[0] if args else 0
+        self.cells.append((y, x, value, attr))
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+screen = FakeScreen()
+app = module.App(screen, "false", "%1", "on")
+app.rows = [module.Row("1", "buffer0001", "alpha")]
+app.preview_cache["buffer0001"] = "buffer preview"
+app.divider_attr = 55
+app.draw()
+
+rendered = "\n".join(value for y, x, value, attr in screen.cells)
+for forbidden in ("Enter paste", "p pin", "Tab pins", "d delete"):
+    if forbidden in rendered:
+        raise SystemExit(f"default UI should not render key hints, found {forbidden!r}: {screen.cells!r}")
+divider_rows = [y for y, x, value, attr in screen.cells if value == "│"]
+if 11 not in divider_rows:
+    raise SystemExit(f"vertical divider should fill the bottom row when no prompt is visible: {screen.cells!r}")
+divider_attrs = [attr for y, x, value, attr in screen.cells if value == "│"]
+if not divider_attrs or any(attr != 55 for attr in divider_attrs):
+    raise SystemExit(f"vertical divider should use white divider attr: {screen.cells!r}")
+horizontal_dividers = [
+    (x, value, attr)
+    for y, x, value, attr in screen.cells
+    if value.startswith("├")
+]
+if not horizontal_dividers:
+    raise SystemExit(f"horizontal divider should connect to the vertical divider: {screen.cells!r}")
+for x, value, attr in horizontal_dividers:
+    if x != 39 or value != "├" + ("─" * 40):
+        raise SystemExit(f"horizontal divider should use tmux-style box drawing: {(x, value, attr)!r}")
+    if attr != 55:
+        raise SystemExit(f"horizontal divider should use white divider attr: {(x, value, attr)!r}")
+rendered_chrome = "\n".join(value for y, x, value, attr in screen.cells if value in ("|", "-") or value.startswith("-"))
+if rendered_chrome:
+    raise SystemExit(f"TUI chrome should not use ASCII divider characters: {screen.cells!r}")
+
+for y, x, value, attr in screen.cells:
+    if x + cell_width(value) > 80:
+        raise SystemExit(f"rendered text crosses screen edge: {(y, x, value)!r}")
+
+app.handle_normal_key(ord(":"))
+screen.erase()
+app.draw()
+footer = "\n".join(value for y, x, value, attr in screen.cells if y == 11)
+if ":" not in footer:
+    raise SystemExit(f"command prompt should render at the bottom: {screen.cells!r}")
+command_horizontal = [(y, x, value) for y, x, value, attr in screen.cells if value.startswith("├")]
+if command_horizontal != [(6, 39, "├" + ("─" * 40))]:
+    raise SystemExit(f"command prompt should not move the horizontal divider: {screen.cells!r}")
+if not any(y == 11 and value == "│" for y, x, value, attr in screen.cells):
+    raise SystemExit(f"vertical divider should still be laid out through the bottom row: {screen.cells!r}")
+if not any(y == 11 and x == 0 and value == ":" for y, x, value, attr in screen.cells):
+    raise SystemExit(f"command prompt should be drawn as a bottom-row overlay: {screen.cells!r}")
+
+app.command_query = "x" * 100
+screen.erase()
+app.draw()
+long_footer = [(index, value) for index, (y, x, value, attr) in enumerate(screen.cells) if y == 11 and x == 0 and value.startswith(":")]
+bottom_vertical = [index for index, (y, x, value, attr) in enumerate(screen.cells) if y == 11 and value == "│"]
+if not long_footer or not bottom_vertical or long_footer[-1][0] <= bottom_vertical[-1]:
+    raise SystemExit(f"long command prompt should overlay the bottom vertical divider: {screen.cells!r}")
+if cell_width(long_footer[-1][1]) != 80:
+    raise SystemExit(f"long command prompt should fill the bottom row when clipped: {long_footer[-1]!r}")
+
+app.command_query = ""
+for char in "help":
+    app.handle_command_key(ord(char))
+action = app.handle_command_key(10)
+if action == "exit" or app.mode != "help":
+    raise SystemExit(f":help should enter help mode, action={action!r}, mode={app.mode!r}")
+screen.erase()
+app.draw()
+help_text = "\n".join(value for y, x, value, attr in screen.cells)
+for expected in ("Buffers", "Pins", ":help", "Enter paste"):
+    if expected not in help_text:
+        raise SystemExit(f"help view missing {expected!r}: {screen.cells!r}")
+
+app.handle_help_key(ord("q"))
+if app.mode != "normal":
+    raise SystemExit(f"q should leave help mode, got {app.mode!r}")
+PY
+  echo "ok - TUI help command replaces default key hints"
+}
+
+test_tui_cursor_visibility_tracks_input_mode() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+cursor_values = []
+module.curses.curs_set = lambda value: cursor_values.append(value)
+
+
+class FakeScreen:
+    def erase(self):
+        pass
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        pass
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+screen = FakeScreen()
+app = module.App(screen, "false", "%1", "off")
+app.rows = [module.Row("1", "buffer0001", "alpha")]
+
+app.draw()
+if cursor_values[-1] != 0:
+    raise SystemExit(f"normal mode should hide cursor, got {cursor_values!r}")
+
+app.mode = "command"
+app.draw()
+if cursor_values[-1] != 1:
+    raise SystemExit(f"command mode should show cursor, got {cursor_values!r}")
+
+app.mode = "search"
+app.draw()
+if cursor_values[-1] != 1:
+    raise SystemExit(f"search mode should show cursor, got {cursor_values!r}")
+
+app.mode = "help"
+app.draw()
+if cursor_values[-1] != 0:
+    raise SystemExit(f"help mode should hide cursor, got {cursor_values!r}")
+PY
+  echo "ok - TUI cursor visibility tracks input mode"
+}
+
+test_tui_configures_fast_escape_delay() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import os
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+delays = []
+module.curses.set_escdelay = lambda value: delays.append(value)
+module.curses.noecho = lambda: None
+module.curses.cbreak = lambda: None
+module.curses.use_default_colors = lambda: None
+module.curses.curs_set = lambda value: None
+
+
+class FakeScreen:
+    def __init__(self):
+        self.keys = [ord("q")]
+
+    def erase(self):
+        pass
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        pass
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+    def getch(self):
+        return self.keys.pop(0)
+
+
+old_escdelay = os.environ.get("ESCDELAY")
+try:
+    screen = FakeScreen()
+    app = module.App(screen, "script", "%1", "off")
+    app.load_rows = lambda: None
+    app.load_pins = lambda: None
+    app.run()
+finally:
+    if old_escdelay is None:
+        os.environ.pop("ESCDELAY", None)
+    else:
+        os.environ["ESCDELAY"] = old_escdelay
+
+if delays != [25]:
+    raise SystemExit(f"TUI should set curses ESC delay to 25ms, got {delays!r}")
+PY
+  echo "ok - TUI configures fast escape delay"
+}
+
+test_tui_pins_focus_previews_selected_pin() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class FakeScreen:
+    def __init__(self):
+        self.cells = []
+
+    def erase(self):
+        self.cells = []
+
+    def getmaxyx(self):
+        return (18, 100)
+
+    def addstr(self, y, x, value, *args):
+        self.cells.append((y, x, value))
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+def fake_run_script(script_path, args, capture=True):
+    raise SystemExit(f"pins focus should not load buffer preview, got {args!r}")
+
+
+module.run_script = fake_run_script
+
+screen = FakeScreen()
+app = module.App(screen, "script", "%1", "on")
+app.rows = [module.Row("1", "buffer0001", "buffer sample")]
+app.pins = [module.Pin(1, "pin line one\npin line two", 1, 1, None)]
+app.focus = "pins"
+app.draw()
+
+right_text = "\n".join(value for y, x, value in screen.cells if x > 40)
+if "pin line one" not in right_text or "pin line two" not in right_text:
+    raise SystemExit(f"pins focus should preview selected pin content: {screen.cells!r}")
+PY
+  echo "ok - TUI pins focus previews selected pin"
+}
+
+test_tui_v_cycles_persisted_layouts() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+from types import SimpleNamespace
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class FakeScreen:
+    def __init__(self):
+        self.cells = []
+
+    def erase(self):
+        self.cells = []
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        self.cells.append((y, x, value))
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+persisted = []
+
+
+def fake_run_script(script_path, args, capture=True):
+    if args == ["preview", "buffer0001"]:
+        return SimpleNamespace(returncode=0, stdout="buffer preview\n", stderr="")
+    if args and args[0] == "set-tui-layout":
+        persisted.append(args[1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    raise SystemExit(f"unexpected script call: {args!r}")
+
+
+module.run_script = fake_run_script
+screen = FakeScreen()
+app = module.App(screen, "script", "%1", "on", "", "both")
+app.rows = [module.Row("1", "buffer0001", "buffer sample")]
+app.pins = [module.Pin(1, "pin one", 1, 1, None)]
+
+app.draw()
+text = "\n".join(value for y, x, value in screen.cells)
+if "buffer preview" not in text or "pin one" not in text or "├" + ("─" * 40) not in text:
+    raise SystemExit(f"both layout should show preview and pins split: {screen.cells!r}")
+
+app.handle_normal_key(ord("v"))
+if app.layout != "preview" or persisted[-1] != "preview" or app.visible_status() != "layout: preview":
+    raise SystemExit(f"first v should persist preview layout, layout={app.layout!r}, persisted={persisted!r}, status={app.visible_status()!r}")
+screen.erase()
+app.draw()
+text = "\n".join(value for y, x, value in screen.cells)
+if "buffer preview" not in text or "pin one" in text or any(value.startswith("├") for y, x, value in screen.cells):
+    raise SystemExit(f"preview layout should show full preview and hide pins: {screen.cells!r}")
+
+app.handle_normal_key(ord("v"))
+if app.layout != "pins" or persisted[-1] != "pins" or app.visible_status() != "layout: pins":
+    raise SystemExit(f"second v should persist pins layout, layout={app.layout!r}, persisted={persisted!r}, status={app.visible_status()!r}")
+screen.erase()
+app.draw()
+text = "\n".join(value for y, x, value in screen.cells)
+if "pin one" not in text or "buffer preview" in text or any(value.startswith("├") for y, x, value in screen.cells):
+    raise SystemExit(f"pins layout should show full pins and hide preview: {screen.cells!r}")
+
+app.handle_normal_key(ord("v"))
+if app.layout != "none" or persisted[-1] != "none" or app.visible_status() != "layout: hidden":
+    raise SystemExit(f"third v should persist hidden layout, layout={app.layout!r}, persisted={persisted!r}, status={app.visible_status()!r}")
+screen.erase()
+app.draw()
+text = "\n".join(value for y, x, value in screen.cells)
+if "pin one" in text or "buffer preview" in text or "│" in text:
+    raise SystemExit(f"hidden layout should show only the buffer list: {screen.cells!r}")
+
+app.handle_normal_key(ord("v"))
+if app.layout != "both" or persisted[-1] != "both" or app.visible_status() != "layout: preview + pins":
+    raise SystemExit(f"fourth v should return to both layout, layout={app.layout!r}, persisted={persisted!r}, status={app.visible_status()!r}")
+PY
+  echo "ok - TUI v cycles persisted layouts"
+}
+
+test_tui_inactive_pins_do_not_show_selection_marker() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class FakeScreen:
+    def __init__(self):
+        self.cells = []
+
+    def erase(self):
+        self.cells = []
+
+    def getmaxyx(self):
+        return (18, 100)
+
+    def addstr(self, y, x, value, *args):
+        self.cells.append((y, x, value))
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+screen = FakeScreen()
+app = module.App(screen, "false", "%1", "on")
+app.rows = [module.Row("1", "buffer0001", "buffer sample")]
+app.preview_cache["buffer0001"] = "buffer preview"
+app.pins = [module.Pin(1, "pin one", 1, 1, None), module.Pin(2, "pin two", 1, 1, None)]
+app.focus = "buffers"
+app.draw()
+
+pin_rows = [value for y, x, value in screen.cells if x > 40 and "pin " in value]
+if not pin_rows:
+    raise SystemExit(f"pins should render in the lower right pane: {screen.cells!r}")
+if any(value.startswith("> ") for value in pin_rows):
+    raise SystemExit(f"inactive pins should not show selection marker: {pin_rows!r}")
+PY
+  echo "ok - TUI inactive pins do not show selection marker"
+}
+
+test_tui_draws_before_loading_rows() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+module.curses.noecho = lambda: None
+module.curses.cbreak = lambda: None
+module.curses.use_default_colors = lambda: None
+module.curses.curs_set = lambda value: None
+
+
+class FakeScreen:
+    def __init__(self):
+        self.refreshes = 0
+        self.keys = [ord("q")]
+
+    def erase(self):
+        pass
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        pass
+
+    def refresh(self):
+        self.refreshes += 1
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+    def getch(self):
+        return self.keys.pop(0)
+
+
+screen = FakeScreen()
+app = module.App(screen, "script", "%1", "off")
+
+def load_rows():
+    if screen.refreshes == 0:
+        raise SystemExit("TUI should draw once before loading tmux rows")
+    app.rows = [module.Row("1", "buffer0001", "alpha")]
+
+app.load_rows = load_rows
+app.load_pins = lambda: None
+app.run()
+PY
+  echo "ok - TUI draws before loading rows"
+}
+
+test_tui_search_uses_vim_match_navigation() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class FakeScreen:
+    def __init__(self):
+        self.strings = []
+
+    def erase(self):
+        self.strings = []
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        self.strings.append(value)
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+screen = FakeScreen()
+app = module.App(screen, "false", "%1", "off")
+app.rows = [
+    module.Row("4", "buffer0004", "alpha"),
+    module.Row("3", "buffer0003", "needle one"),
+    module.Row("2", "buffer0002", "beta"),
+    module.Row("1", "buffer0001", "needle two"),
+]
+
+app.handle_normal_key(ord("/"))
+for char in "needle":
+    app.handle_search_key(ord(char))
+action = app.handle_search_key(10)
+
+if action == "exit":
+    raise SystemExit("search Enter should not exit or paste")
+if app.mode != "normal":
+    raise SystemExit(f"search Enter should return to normal mode, got {app.mode!r}")
+if app.selected != 1:
+    raise SystemExit(f"search should jump to first match after cursor, got index {app.selected}")
+
+app.draw()
+rendered = "\n".join(screen.strings)
+for expected in ("alpha", "beta", "needle one", "needle two"):
+    if expected not in rendered:
+        raise SystemExit(f"search should not filter rows; missing {expected!r} in {rendered!r}")
+
+app.handle_normal_key(ord("n"))
+if app.selected != 3:
+    raise SystemExit(f"n should jump to next match, got index {app.selected}")
+app.handle_normal_key(ord("n"))
+if app.selected != 1:
+    raise SystemExit(f"n should wrap to first match, got index {app.selected}")
+app.handle_normal_key(ord("N"))
+if app.selected != 3:
+    raise SystemExit(f"N should jump to previous match, got index {app.selected}")
+PY
+  echo "ok - TUI search uses vim match navigation"
+}
+
+test_tui_normal_mode_supports_numeric_jump_counts() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class FakeScreen:
+    def __init__(self):
+        self.cells = []
+
+    def erase(self):
+        self.cells = []
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        self.cells.append((y, x, value))
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+screen = FakeScreen()
+app = module.App(screen, "false", "%1", "off")
+app.rows = [module.Row(str(index), f"buffer{index:04d}", f"row {index}") for index in range(10)]
+
+app.handle_normal_key(ord("3"))
+app.draw()
+footer = "\n".join(value for y, x, value in screen.cells if y in (10, 11))
+if "3" not in footer:
+    raise SystemExit(f"pending count should render in footer: {screen.cells!r}")
+
+app.handle_normal_key(ord("j"))
+if app.selected != 3:
+    raise SystemExit(f"3j should move down 3 rows, got index {app.selected}")
+if app.pending_count != "":
+    raise SystemExit("count should clear after counted movement")
+
+app.handle_normal_key(ord("2"))
+app.handle_normal_key(ord("k"))
+if app.selected != 1:
+    raise SystemExit(f"2k should move up 2 rows, got index {app.selected}")
+
+app.handle_normal_key(ord("9"))
+app.handle_normal_key(ord("9"))
+app.handle_normal_key(ord("j"))
+if app.selected != 9:
+    raise SystemExit(f"counted movement should clamp at last row, got index {app.selected}")
+
+app.handle_normal_key(ord("4"))
+app.handle_normal_key(27)
+if app.pending_count != "":
+    raise SystemExit("Esc should clear pending count")
+app.handle_normal_key(ord("j"))
+if app.selected != 9:
+    raise SystemExit(f"after Esc clears count, j should move one row and stay clamped at 9; got {app.selected}")
+
+app.mode = "search"
+app.query = ""
+app.handle_search_key(ord("5"))
+if app.query != "5":
+    raise SystemExit(f"digits in search mode should edit the search query, got {app.query!r}")
+PY
+  echo "ok - TUI normal mode supports numeric jump counts"
+}
+
+test_tui_escape_exits_only_plain_normal_mode() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+app = module.App(None, "false", "%1", "off")
+
+action = app.handle_normal_key(27)
+if action != "exit":
+    raise SystemExit(f"Esc in plain normal mode should exit popup, got {action!r}")
+
+app = module.App(None, "false", "%1", "off")
+app.handle_normal_key(ord("4"))
+action = app.handle_normal_key(27)
+if action == "exit" or app.pending_count != "":
+    raise SystemExit(f"Esc with a pending count should only clear count, action={action!r}, count={app.pending_count!r}")
+
+app = module.App(None, "false", "%1", "off")
+app.mode = "search"
+app.query = "abc"
+action = app.handle_search_key(27)
+if action == "exit" or app.mode != "normal" or app.query != "":
+    raise SystemExit(f"Esc in search mode should leave search mode only, action={action!r}, mode={app.mode!r}, query={app.query!r}")
+
+app = module.App(None, "false", "%1", "off")
+app.mode = "command"
+app.command_query = "help"
+action = app.handle_command_key(27)
+if action == "exit" or app.mode != "normal" or app.command_query != "":
+    raise SystemExit(
+        f"Esc in command mode should leave command mode only, action={action!r}, mode={app.mode!r}, query={app.command_query!r}"
+    )
+
+app = module.App(None, "false", "%1", "off")
+app.mode = "help"
+action = app.handle_help_key(27)
+if action == "exit" or app.mode != "normal":
+    raise SystemExit(f"Esc in help mode should close help only, action={action!r}, mode={app.mode!r}")
+PY
+  echo "ok - TUI Esc exits only plain normal mode"
+}
+
+test_tui_vim_navigation_keys() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class FakeScreen:
+    def erase(self):
+        pass
+
+    def getmaxyx(self):
+        return (12, 80)
+
+    def addstr(self, y, x, value, *args):
+        pass
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+app = module.App(FakeScreen(), "false", "%1", "off")
+app.rows = [module.Row(str(index), f"buffer{index:04d}", f"row {index}") for index in range(30)]
+app.draw()
+
+app.handle_normal_key(4)  # C-d
+if app.selected != 6:
+    raise SystemExit(f"C-d should move half page down, got {app.selected}")
+app.handle_normal_key(21)  # C-u
+if app.selected != 0:
+    raise SystemExit(f"C-u should move half page up, got {app.selected}")
+
+app.handle_normal_key(6)  # C-f
+if app.selected != 12:
+    raise SystemExit(f"C-f should move one page down, got {app.selected}")
+app.handle_normal_key(2)  # C-b
+if app.selected != 0:
+    raise SystemExit(f"C-b should move one page up, got {app.selected}")
+
+app.handle_normal_key(module.curses.KEY_NPAGE)
+if app.selected != 12:
+    raise SystemExit(f"PageDown should move one page down, got {app.selected}")
+app.handle_normal_key(module.curses.KEY_PPAGE)
+if app.selected != 0:
+    raise SystemExit(f"PageUp should move one page up, got {app.selected}")
+
+action = app.handle_normal_key(ord("g"))
+if action == "exit" or app.selected != 0:
+    raise SystemExit(f"single g should wait for a second g, action={action!r}, selected={app.selected}")
+app.handle_normal_key(ord("g"))
+if app.selected != 0:
+    raise SystemExit(f"gg should move to top, got {app.selected}")
+
+app.handle_normal_key(ord("G"))
+if app.selected != 29:
+    raise SystemExit(f"G should move to bottom, got {app.selected}")
+
+app.draw()
+app.handle_normal_key(ord("H"))
+if app.selected != app.scroll:
+    raise SystemExit(f"H should move to top visible row, selected={app.selected}, scroll={app.scroll}")
+app.handle_normal_key(ord("M"))
+middle = min(len(app.rows) - 1, app.scroll + max(0, app.list_page_size // 2))
+if app.selected != middle:
+    raise SystemExit(f"M should move to middle visible row, got {app.selected}, expected {middle}")
+app.handle_normal_key(ord("L"))
+bottom = min(len(app.rows) - 1, app.scroll + app.list_page_size - 1)
+if app.selected != bottom:
+    raise SystemExit(f"L should move to bottom visible row, got {app.selected}, expected {bottom}")
+
+if app.handle_normal_key(3) != "exit":
+    raise SystemExit("C-c should exit popup like native tmux copy-mode-vi")
+PY
+  echo "ok - TUI supports vim navigation keys"
+}
+
+test_tui_pins_use_sqlite_and_pin_focus_management() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import os
+import sqlite3
+import sys
+import tempfile
+from types import SimpleNamespace
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class FakeScreen:
+    def erase(self):
+        pass
+
+    def getmaxyx(self):
+        return (18, 100)
+
+    def addstr(self, y, x, value, *args):
+        pass
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    db_path = os.path.join(tmpdir, "pins.sqlite3")
+    pasted = []
+
+    def fake_run_script(script_path, args, capture=True):
+        if args == ["preview", "buffer0001"]:
+            return SimpleNamespace(returncode=0, stdout="common phrase\n", stderr="")
+        if args and args[0] == "paste-text-file":
+            with open(args[1], "r", encoding="utf-8") as handle:
+                pasted.append(handle.read())
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise SystemExit(f"unexpected script call: {args!r}")
+
+    module.run_script = fake_run_script
+
+    app = module.App(FakeScreen(), "script", "%1", "on", db_path)
+    app.rows = [module.Row("1", "buffer0001", "common phrase")]
+
+    app.handle_normal_key(ord("p"))
+    app.handle_normal_key(ord("p"))
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT content FROM pins").fetchall()
+    if rows != [("common phrase",)]:
+        raise SystemExit(f"pin should be persisted once, got {rows!r}")
+
+    app.handle_normal_key(9)
+    if app.focus != "pins":
+        raise SystemExit(f"Tab should move focus to pins, got {app.focus!r}")
+
+    action = app.handle_normal_key(10)
+    if action != "exit" or pasted != ["common phrase"]:
+        raise SystemExit(f"Enter in pins focus should paste and exit, action={action!r}, pasted={pasted!r}")
+
+    editor = os.path.join(tmpdir, "editor")
+    with open(editor, "w", encoding="utf-8") as handle:
+        handle.write("#!/usr/bin/env sh\nprintf '%s\\n' 'edited phrase' >\"$1\"\n")
+    os.chmod(editor, 0o755)
+    old_editor = os.environ.get("EDITOR")
+    os.environ["EDITOR"] = editor
+    try:
+        app = module.App(FakeScreen(), "script", "%1", "on", db_path)
+        app.load_pins()
+        app.focus = "pins"
+        app.handle_normal_key(ord("e"))
+    finally:
+        if old_editor is None:
+            os.environ.pop("EDITOR", None)
+        else:
+            os.environ["EDITOR"] = old_editor
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT content FROM pins").fetchall()
+    if rows != [("edited phrase",)]:
+        raise SystemExit(f"edit should update pin content, got {rows!r}")
+
+    app.handle_normal_key(ord("d"))
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT content FROM pins").fetchall()
+    if rows:
+        raise SystemExit(f"delete should remove pin, got {rows!r}")
+PY
+  echo "ok - TUI pins use sqlite and pin focus management"
+}
+
+test_delete_buffer_removes_auto_buffer() {
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-buffer -b buffer0001 'alpha'
+  tmux_test "$sock" set-buffer -b buffer0002 'beta'
+
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" delete buffer0001
+
+  buffers=$(tmux_test "$sock" list-buffers -F '#{buffer_name}')
+  assert_not_contains "$buffers" "buffer0001" "delete removes selected auto buffer"
+  assert_contains "$buffers" "buffer0002" "delete keeps other buffers"
+
+  if TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" delete named >/dev/null 2>&1; then
+    fail "delete rejects explicit buffer names"
+  fi
+
+  stop_tmux "$sock"
+  trap - EXIT HUP INT TERM
+  echo "ok - delete removes auto buffer"
+}
+
+test_edit_buffer_round_trips_through_editor() {
+  sock=$(start_tmux)
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-editor.XXXXXX")
+  trap 'rm -rf "$tmpdir"; stop_tmux "$sock"' EXIT HUP INT TERM
+
+  cat >"$tmpdir/editor" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' 'edited from fake editor' >"$1"
+SH
+  chmod +x "$tmpdir/editor"
+
+  tmux_test "$sock" set-buffer -b buffer0001 'before edit'
+
+  EDITOR="$tmpdir/editor" TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" edit buffer0001
+
+  content=$(tmux_test "$sock" show-buffer -b buffer0001)
+  assert_eq "edited from fake editor" "$content" "edit reloads modified file into the same buffer"
+
+  stop_tmux "$sock"
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - edit round-trips through editor"
+}
+
+test_edit_buffer_preserves_missing_final_newline() {
+  sock=$(start_tmux)
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-editor-eol.XXXXXX")
+  trap 'rm -rf "$tmpdir"; stop_tmux "$sock"' EXIT HUP INT TERM
+
+  cat >"$tmpdir/editor" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' 'after edit' >"$1"
+SH
+  chmod +x "$tmpdir/editor"
+
+  tmux_test "$sock" set-buffer -b buffer0001 'before'
+
+  EDITOR="$tmpdir/editor" TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" edit buffer0001
+
+  tmux_test "$sock" save-buffer -b buffer0001 "$tmpdir/out"
+  hex=$(od -An -tx1 "$tmpdir/out" | tr -d ' \n')
+  assert_eq "61667465722065646974" "$hex" "edit strips editor-added final newline when original had none"
+
+  stop_tmux "$sock"
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - edit preserves missing final newline"
+}
+
+test_set_buffer_file_replaces_auto_buffer_content() {
+  sock=$(start_tmux)
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-set-buffer.XXXXXX")
+  trap 'rm -rf "$tmpdir"; stop_tmux "$sock"' EXIT HUP INT TERM
+
+  tmux_test "$sock" set-buffer -b buffer0001 'before'
+  printf '%s' 'restored from undo' >"$tmpdir/content.txt"
+
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" set-buffer-file buffer0001 "$tmpdir/content.txt"
+
+  content=$(tmux_test "$sock" show-buffer -b buffer0001)
+  assert_eq "restored from undo" "$content" "set-buffer-file replaces selected auto buffer content"
+
+  if TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" set-buffer-file named "$tmpdir/content.txt" >/dev/null 2>&1; then
+    fail "set-buffer-file rejects explicit buffer names"
+  fi
+
+  stop_tmux "$sock"
+  rm -rf "$tmpdir"
+  trap - EXIT HUP INT TERM
+  echo "ok - set-buffer-file replaces auto buffer content"
+}
+
+test_tui_undo_redo_buffer_and_pin_changes() {
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import os
+import sqlite3
+import sys
+import tempfile
+from types import SimpleNamespace
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class FakeScreen:
+    def erase(self):
+        pass
+
+    def getmaxyx(self):
+        return (18, 100)
+
+    def addstr(self, y, x, value, *args):
+        pass
+
+    def refresh(self):
+        pass
+
+    def move(self, y, x):
+        pass
+
+    def keypad(self, enabled):
+        pass
+
+
+module.curses.def_prog_mode = lambda: None
+module.curses.endwin = lambda: None
+module.curses.reset_prog_mode = lambda: None
+module.curses.curs_set = lambda value: None
+
+buffers = {"buffer0001": "alpha", "buffer0002": "beta", "buffer0003": "gamma"}
+buffer_order = ["buffer0003", "buffer0002", "buffer0001"]
+
+
+def displayed_buffers(app):
+    return [row.name for row in app.rows]
+
+
+def move_buffer_to_front(name):
+    if name in buffer_order:
+        buffer_order.remove(name)
+    buffer_order.insert(0, name)
+
+
+def buffer_rows():
+    rows = []
+    for index, name in enumerate(buffer_order, start=1):
+        if name not in buffers:
+            continue
+        sample = module.content_sample(buffers[name])
+        rows.append(f"{index}\t{name}\t{sample}")
+    return "\n".join(rows) + ("\n" if rows else "")
+
+
+def fake_run_script(script_path, args, capture=True):
+    if args == ["list-tui-rows"]:
+        return SimpleNamespace(returncode=0, stdout=buffer_rows(), stderr="")
+    if args[:1] == ["preview"]:
+        name = args[1]
+        if name not in buffers:
+            return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+        return SimpleNamespace(returncode=0, stdout=buffers[name], stderr="")
+    if args[:1] == ["delete"]:
+        buffers.pop(args[1], None)
+        if args[1] in buffer_order:
+            buffer_order.remove(args[1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    if args[:1] == ["edit"]:
+        buffers[args[1]] = "edited buffer"
+        move_buffer_to_front(args[1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    if args[:1] == ["set-buffer-file"]:
+        with open(args[2], "r", encoding="utf-8") as handle:
+            buffers[args[1]] = handle.read()
+        move_buffer_to_front(args[1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    raise SystemExit(f"unexpected script call: {args!r}")
+
+
+module.run_script = fake_run_script
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    db_path = os.path.join(tmpdir, "pins.sqlite3")
+    app = module.App(FakeScreen(), "script", "%1", "on", db_path)
+    app.load_rows()
+    initial_order = displayed_buffers(app)
+    if initial_order != ["buffer0003", "buffer0002", "buffer0001"]:
+        raise SystemExit(f"initial order should follow tmux recency, got {initial_order!r}")
+
+    app.selected = 1
+    app.handle_normal_key(ord("d"))
+    after_delete_order = displayed_buffers(app)
+    if after_delete_order != ["buffer0003", "buffer0001"]:
+        raise SystemExit(f"d should keep remaining buffer order, got {after_delete_order!r}")
+    if "buffer0002" in buffers:
+        raise SystemExit(f"d should delete selected buffer, got {buffers!r}")
+    app.handle_normal_key(ord("u"))
+    if buffers.get("buffer0002") != "beta":
+        raise SystemExit(f"u should restore deleted buffer, got {buffers!r}")
+    if displayed_buffers(app) != initial_order:
+        raise SystemExit(f"u should restore buffer order before delete, got {displayed_buffers(app)!r}")
+    app.handle_normal_key(18)
+    if "buffer0002" in buffers:
+        raise SystemExit(f"C-r should redo buffer delete, got {buffers!r}")
+    if displayed_buffers(app) != after_delete_order:
+        raise SystemExit(f"C-r should restore buffer order after delete, got {displayed_buffers(app)!r}")
+
+    buffers["buffer0002"] = "beta"
+    if "buffer0002" in buffer_order:
+        buffer_order.remove("buffer0002")
+    buffer_order.insert(1, "buffer0002")
+    app.load_rows()
+    before_edit_order = displayed_buffers(app)
+    app.selected = 2
+    app.handle_normal_key(ord("e"))
+    after_edit_order = displayed_buffers(app)
+    if buffers.get("buffer0001") != "edited buffer":
+        raise SystemExit(f"e should edit selected buffer, got {buffers!r}")
+    if after_edit_order != ["buffer0001", "buffer0003", "buffer0002"]:
+        raise SystemExit(f"e should reflect tmux moving edited buffer to top, got {after_edit_order!r}")
+    app.handle_normal_key(ord("u"))
+    if buffers.get("buffer0001") != "alpha":
+        raise SystemExit(f"u should restore buffer content before edit, got {buffers!r}")
+    if displayed_buffers(app) != before_edit_order:
+        raise SystemExit(f"u should restore buffer order before edit, got {displayed_buffers(app)!r}")
+    app.handle_normal_key(18)
+    if buffers.get("buffer0001") != "edited buffer":
+        raise SystemExit(f"C-r should redo buffer edit, got {buffers!r}")
+    if displayed_buffers(app) != after_edit_order:
+        raise SystemExit(f"C-r should restore buffer order after edit, got {displayed_buffers(app)!r}")
+
+    app.selected = 0
+    app.handle_normal_key(ord("p"))
+    with sqlite3.connect(db_path) as conn:
+        pins = conn.execute("SELECT content FROM pins").fetchall()
+    if pins != [("edited buffer",)]:
+        raise SystemExit(f"p should add pin, got {pins!r}")
+    app.handle_normal_key(ord("u"))
+    with sqlite3.connect(db_path) as conn:
+        pins = conn.execute("SELECT content FROM pins").fetchall()
+    if pins:
+        raise SystemExit(f"u should remove added pin, got {pins!r}")
+    app.handle_normal_key(18)
+    with sqlite3.connect(db_path) as conn:
+        pins = conn.execute("SELECT content FROM pins").fetchall()
+    if pins != [("edited buffer",)]:
+        raise SystemExit(f"C-r should restore added pin, got {pins!r}")
+
+    app.load_pins()
+    app.focus = "pins"
+
+    def fake_editor(path):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("edited pin")
+        return SimpleNamespace(returncode=0)
+
+    app.run_editor = fake_editor
+    app.handle_normal_key(ord("e"))
+    with sqlite3.connect(db_path) as conn:
+        pins = conn.execute("SELECT content FROM pins").fetchall()
+    if pins != [("edited pin",)]:
+        raise SystemExit(f"e should edit selected pin, got {pins!r}")
+    app.handle_normal_key(ord("u"))
+    with sqlite3.connect(db_path) as conn:
+        pins = conn.execute("SELECT content FROM pins").fetchall()
+    if pins != [("edited buffer",)]:
+        raise SystemExit(f"u should restore pin content before edit, got {pins!r}")
+    app.handle_normal_key(18)
+    with sqlite3.connect(db_path) as conn:
+        pins = conn.execute("SELECT content FROM pins").fetchall()
+    if pins != [("edited pin",)]:
+        raise SystemExit(f"C-r should redo pin edit, got {pins!r}")
+
+    app.handle_normal_key(ord("d"))
+    with sqlite3.connect(db_path) as conn:
+        pins = conn.execute("SELECT content FROM pins").fetchall()
+    if pins:
+        raise SystemExit(f"d should delete selected pin, got {pins!r}")
+    app.handle_normal_key(ord("u"))
+    with sqlite3.connect(db_path) as conn:
+        pins = conn.execute("SELECT content FROM pins").fetchall()
+    if pins != [("edited pin",)]:
+        raise SystemExit(f"u should restore deleted pin, got {pins!r}")
+    app.handle_normal_key(18)
+    with sqlite3.connect(db_path) as conn:
+        pins = conn.execute("SELECT content FROM pins").fetchall()
+    if pins:
+        raise SystemExit(f"C-r should redo pin delete, got {pins!r}")
+PY
+  echo "ok - TUI undo and redo buffer/pin changes"
+}
+
+test_prefix_equal_tui_popup_enter_pastes_selected_buffer() {
+  if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+    echo "ok - prefix = TUI popup Enter paste skipped because Python is missing"
+    return
+  fi
+
+  sock=$(new_tmux_socket)
+  client_pid=$(start_attached_client "$sock")
+  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+
+  client=$(wait_for_client "$sock")
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+  tmux_test "$sock" set-buffer -b buffer0001 'popup-enter-paste'
+
+  tmux_test "$sock" switch-client -c "$client" -T prefix
+  tmux_test "$sock" send-keys -c "$client" -K =
+  sleep 1
+  tmux_test "$sock" send-keys -c "$client" -K Enter
+  sleep 1
+
+  pane=$(capture_pane_text "$sock")
+  assert_contains "$pane" "popup-enter-paste" "TUI popup Enter pastes selected buffer into invoking pane"
+
+  stop_tmux "$sock"
+  wait "$client_pid" >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  echo "ok - prefix = TUI popup Enter pastes selected buffer"
+}
+
+test_prefix_equal_tui_popup_q_does_not_paste() {
+  if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+    echo "ok - prefix = TUI popup q cancel skipped because Python is missing"
+    return
+  fi
+
+  sock=$(new_tmux_socket)
+  client_pid=$(start_attached_client "$sock")
+  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+
+  client=$(wait_for_client "$sock")
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+  tmux_test "$sock" set-buffer -b buffer0001 'popup-q-cancel'
+
+  tmux_test "$sock" switch-client -c "$client" -T prefix
+  tmux_test "$sock" send-keys -c "$client" -K =
+  sleep 1
+  tmux_test "$sock" send-keys -c "$client" -K q
+  sleep 0.5
+
+  pane=$(capture_pane_text "$sock")
+  assert_not_contains "$pane" "popup-q-cancel" "TUI popup q exits without paste"
+
+  stop_tmux "$sock"
+  wait "$client_pid" >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  echo "ok - prefix = TUI popup q exits without paste"
+}
+
+test_prefix_equal_tui_popup_d_deletes_selected_buffer() {
+  if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+    echo "ok - prefix = TUI popup d delete skipped because Python is missing"
+    return
+  fi
+
+  sock=$(new_tmux_socket)
+  client_pid=$(start_attached_client "$sock")
+  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+
+  client=$(wait_for_client "$sock")
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+  tmux_test "$sock" set-buffer -b buffer0001 'older-buffer'
+  sleep 1
+  tmux_test "$sock" set-buffer -b buffer0002 'newer-buffer'
+
+  tmux_test "$sock" switch-client -c "$client" -T prefix
+  tmux_test "$sock" send-keys -c "$client" -K =
+  sleep 1
+  tmux_test "$sock" send-keys -c "$client" -K d
+  sleep 0.5
+  tmux_test "$sock" send-keys -c "$client" -K q
+  sleep 0.5
+
+  buffers=$(tmux_test "$sock" list-buffers -F '#{buffer_name}')
+  assert_not_contains "$buffers" "buffer0002" "TUI popup d deletes selected newest buffer"
+  assert_contains "$buffers" "buffer0001" "TUI popup d keeps older buffer"
+
+  stop_tmux "$sock"
+  wait "$client_pid" >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  echo "ok - prefix = TUI popup d deletes selected buffer"
 }
 
 test_binding_options_are_respected() {
@@ -285,14 +2265,76 @@ test_binding_options_are_respected() {
   assert_not_contains "$default_paste" "tmux-better-copy-buffer.sh" "bind-keys off leaves prefix ] unchanged"
 
   tmux_test "$sock" set-option -g @better-copy-buffer-bind-keys on
+  tmux_test "$sock" set-option -g @better-copy-buffer-ui tui
+  tmux_test "$sock" set-option -g @better-copy-buffer-popup-width 95%
+  tmux_test "$sock" set-option -g @better-copy-buffer-popup-height 90%
+  tmux_test "$sock" set-option -g @better-copy-buffer-choose-key F
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  tui_choose=$(tmux_test "$sock" list-keys -T prefix F)
+  assert_contains "$tui_choose" "display-popup" "TUI choose key opens a popup"
+  assert_contains "$tui_choose" "-w 95%" "TUI choose key uses configured popup width"
+  assert_contains "$tui_choose" "-h 90%" "TUI choose key uses configured popup height"
+  assert_not_contains "$tui_choose" "-S" "TUI choose key leaves popup border style to tmux defaults"
+  assert_contains "$tui_choose" "TMUX_BCB_STATUS_STYLE=#{status-style}" "TUI choose key passes status style to the TUI"
+  assert_not_contains "$tui_choose" "-S #{status-style}" "TUI popup border style does not inherit status-style"
+  assert_contains "$tui_choose" "TMUX_BCB_TARGET=#{pane_id}" "TUI choose key passes target pane through popup environment"
+  assert_contains "$tui_choose" "scripts/tui.py" "TUI choose key starts the Python TUI directly"
+  assert_not_contains "$tui_choose" "choose-tui" "TUI choose key avoids the choose-tui wrapper on startup"
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-popup-border-style 'fg=colour39,bg=default'
+  tmux_test "$sock" set-option -g @better-copy-buffer-choose-key G
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  styled_tui_choose=$(tmux_test "$sock" list-keys -T prefix G)
+  assert_not_contains "$styled_tui_choose" "fg=colour39,bg=default" "removed popup border style option is ignored"
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-ui native
+  tmux_test "$sock" set-option -g @better-copy-buffer-choose-key N
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  native_choose=$(tmux_test "$sock" list-keys -T prefix N)
+  assert_contains "$native_choose" "choose-buffer" "native UI choose key opens tmux choose-buffer"
+  assert_not_contains "$native_choose" "display-popup" "native UI choose key does not open a popup"
+
   tmux_test "$sock" set-option -g @better-copy-buffer-choose-key B
   tmux_test "$sock" set-option -g @better-copy-buffer-paste-key P
   TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
 
   custom_choose=$(tmux_test "$sock" list-keys -T prefix B)
   custom_paste=$(tmux_test "$sock" list-keys -T prefix P)
-  assert_contains "$custom_choose" "tmux-better-copy-buffer.sh choose" "custom choose key is bound"
+  assert_contains "$custom_choose" "choose-buffer" "custom choose key opens native chooser directly"
+  assert_contains "$custom_choose" "-O time" "custom choose key sorts native chooser by time"
+  assert_contains "$custom_choose" "-F \"#{buffer_sample}\"" "custom choose key shows buffer samples by default"
+  assert_not_contains "$custom_choose" "choose-buffer -Z" "custom choose key does not zoom by default"
+  assert_not_contains "$custom_choose" "choose-buffer -N" "custom choose key keeps native preview visible by default"
+  assert_contains "$custom_choose" "run-shell" "custom choose key runs paste-touch after selection"
+  assert_contains "$custom_choose" "tmux-better-copy-buffer.sh paste-touch" "custom choose key still refreshes pasted buffers"
+  assert_not_contains "$custom_choose" "run-shell -b" "custom choose key waits for paste before returning to pane"
+  assert_not_contains "$custom_choose" "tmux-better-copy-buffer.sh choose" "custom choose key avoids shell wrapper on open"
   assert_contains "$custom_paste" "tmux-better-copy-buffer.sh paste-latest" "custom paste key is bound"
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-preview off
+  tmux_test "$sock" set-option -g @better-copy-buffer-choose-key C
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  preview_choose=$(tmux_test "$sock" list-keys -T prefix C)
+  assert_contains "$preview_choose" "choose-buffer -N" "preview option can disable initial preview"
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-preview on
+  tmux_test "$sock" set-option -g @better-copy-buffer-zoom on
+  tmux_test "$sock" set-option -g @better-copy-buffer-choose-key Z
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  zoom_choose=$(tmux_test "$sock" list-keys -T prefix Z)
+  assert_contains "$zoom_choose" "choose-buffer -Z" "zoom option can open chooser in a zoomed pane"
+
+  tmux_test "$sock" set-option -g @better-copy-buffer-list-format '#{buffer_name} #{buffer_size} bytes'
+  tmux_test "$sock" set-option -g @better-copy-buffer-choose-key L
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  list_format_choose=$(tmux_test "$sock" list-keys -T prefix L)
+  assert_contains "$list_format_choose" "-F \"#{buffer_name} #{buffer_size} bytes\"" "list format option can use lightweight rows"
 
   stop_tmux "$sock"
   trap - EXIT HUP INT TERM
@@ -300,11 +2342,12 @@ test_binding_options_are_respected() {
 }
 
 test_reverse_sort_option_is_respected() {
-  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  sock=$(new_tmux_socket)
   client_pid=$(start_attached_client "$sock")
   trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
 
   client=$(wait_for_client "$sock")
+  tmux_test "$sock" set-option -g @better-copy-buffer-ui native
   tmux_test "$sock" set-option -g @better-copy-buffer-reverse-sort on
   TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
 
@@ -316,7 +2359,8 @@ test_reverse_sort_option_is_respected() {
   sleep 0.5
 
   messages=$(tmux_test "$sock" show-messages)
-  assert_contains "$messages" "choose-buffer -r -O time" "reverse sort option passes -r to native chooser"
+  assert_contains "$messages" "key =: choose-buffer -r" "reverse sort option passes -r to native chooser"
+  assert_contains "$messages" "-O time" "reverse sort option keeps native chooser sorted by time"
 
   tmux_test "$sock" send-keys q >/dev/null 2>&1 || true
   stop_tmux "$sock"
@@ -343,7 +2387,7 @@ test_non_auto_buffer_names_are_rejected() {
 }
 
 test_default_display_message_on_binding_failure() {
-  sock=$(mktemp -u "/tmp/tmux-bcb-test.XXXXXX")
+  sock=$(new_tmux_socket)
   client_pid=$(start_attached_client "$sock")
   trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
 
@@ -398,13 +2442,48 @@ test_paste_latest_without_buffers_fails_cleanly() {
   echo "ok - paste-latest without buffers fails cleanly"
 }
 
+test_list_tui_rows_returns_list_buffers_failure
+test_list_tui_rows_sorts_newest_first
+test_tui_popup_binding_passes_current_pane_to_choose_tui
+test_paste_touch_uses_target_pane_when_provided
+test_paste_text_file_pastes_arbitrary_text
+test_paste_text_file_adds_auto_buffer_without_deduplicating_existing
+test_choose_tui_passes_target_pane_to_program
+test_choose_tui_starts_python_without_curses_probe
+test_choose_tui_missing_python_fallback_targets_pane
+test_set_tui_layout_persists_tmux_option
 test_paste_touch_makes_buffer_latest
 test_paste_touch_preserves_shell_sensitive_content
 test_recreate_strategy_recreates_buffer_with_new_auto_name
 test_invalid_recency_strategy_fails_before_paste
 test_prefix_equal_opens_native_buffer_chooser
+test_chooser_selection_does_not_send_enter_before_paste
 test_auto_buffer_filter_excludes_explicit_names
 test_prefix_bracket_pastes_latest_buffer
+test_tui_rows_preserve_buffer_ids_and_samples
+test_tui_chrome_hides_pane_labels
+test_tui_does_not_use_reverse_video
+test_tui_selected_rows_use_status_background
+test_tui_help_command_replaces_default_key_hints
+test_tui_cursor_visibility_tracks_input_mode
+test_tui_configures_fast_escape_delay
+test_tui_pins_focus_previews_selected_pin
+test_tui_v_cycles_persisted_layouts
+test_tui_inactive_pins_do_not_show_selection_marker
+test_tui_draws_before_loading_rows
+test_tui_search_uses_vim_match_navigation
+test_tui_normal_mode_supports_numeric_jump_counts
+test_tui_escape_exits_only_plain_normal_mode
+test_tui_vim_navigation_keys
+test_tui_pins_use_sqlite_and_pin_focus_management
+test_delete_buffer_removes_auto_buffer
+test_edit_buffer_round_trips_through_editor
+test_edit_buffer_preserves_missing_final_newline
+test_set_buffer_file_replaces_auto_buffer_content
+test_tui_undo_redo_buffer_and_pin_changes
+test_prefix_equal_tui_popup_enter_pastes_selected_buffer
+test_prefix_equal_tui_popup_q_does_not_paste
+test_prefix_equal_tui_popup_d_deletes_selected_buffer
 test_binding_options_are_respected
 test_reverse_sort_option_is_respected
 test_non_auto_buffer_names_are_rejected

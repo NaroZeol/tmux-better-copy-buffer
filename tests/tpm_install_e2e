@@ -19,10 +19,28 @@ assert_contains() {
   esac
 }
 
+assert_not_contains() {
+  haystack=$1
+  needle=$2
+  message=$3
+
+  case "$haystack" in
+    *"$needle"*) printf 'not ok - %s\nunexpected: %s\nin:         %s\n' "$message" "$needle" "$haystack" >&2; exit 1 ;;
+    *) ;;
+  esac
+}
+
 plugin_name_from_spec() {
   spec_without_ref=${1%%#*}
   basename_value=$(basename "$spec_without_ref")
   printf '%s\n' "${basename_value%.git}"
+}
+
+is_local_plugin_spec() {
+  case $1 in
+    /* | ./* | ../*) return 0 ;;
+    *) [ -d "$1" ] ;;
+  esac
 }
 
 if ! command -v git >/dev/null 2>&1; then
@@ -33,9 +51,9 @@ if ! command -v tmux >/dev/null 2>&1; then
   fail "tmux is required"
 fi
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/tmux-bcb-tpm-e2e.XXXXXX")
+tmp=$(mktemp -d "/tmp/tmux-bcb-tpm.XXXXXX")
 cleanup() {
-  HOME="$tmp/home" TMUX_TMPDIR="$tmp/tmux-tmp" tmux kill-server >/dev/null 2>&1 || true
+  HOME="$tmp/home" TMUX_TMPDIR="$tmp/t" tmux kill-server >/dev/null 2>&1 || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT HUP INT TERM
@@ -43,7 +61,7 @@ trap cleanup EXIT HUP INT TERM
 unset TMUX || true
 export HOME="$tmp/home"
 export XDG_CONFIG_HOME="$HOME/.config"
-export TMUX_TMPDIR="$tmp/tmux-tmp"
+export TMUX_TMPDIR="$tmp/t"
 
 mkdir -p "$HOME/.tmux/plugins" "$XDG_CONFIG_HOME" "$TMUX_TMPDIR"
 git clone --depth 1 https://github.com/tmux-plugins/tpm "$HOME/.tmux/plugins/tpm" >/dev/null 2>&1 ||
@@ -62,15 +80,26 @@ tmux source-file "$HOME/.tmux.conf"
 tmux source-file "$HOME/.tmux.conf"
 
 plugin_name=$(plugin_name_from_spec "$PLUGIN_SPEC")
-plugin_dir="$HOME/.tmux/plugins/$plugin_name"
+plugin_source=${PLUGIN_SPEC%%#*}
+if is_local_plugin_spec "$plugin_source"; then
+  plugin_dir=$(CDPATH= cd -- "$plugin_source" && pwd)
+else
+  plugin_dir="$HOME/.tmux/plugins/$plugin_name"
+fi
 
-[ -d "$plugin_dir/.git" ] || fail "TPM installed plugin git directory"
+[ -d "$plugin_dir" ] || fail "TPM installed plugin directory"
+if ! is_local_plugin_spec "$plugin_source"; then
+  [ -d "$plugin_dir/.git" ] || fail "TPM installed plugin git directory"
+fi
 [ -f "$plugin_dir/tmux-better-copy-buffer.tmux" ] || fail "TPM installed plugin entrypoint"
 [ -x "$plugin_dir/scripts/tmux-better-copy-buffer.sh" ] || fail "TPM installed executable runtime script"
 
 choose_binding=$(tmux list-keys -T prefix = 2>/dev/null || true)
 paste_binding=$(tmux list-keys -T prefix ']' 2>/dev/null || true)
-assert_contains "$choose_binding" "$plugin_dir/scripts/tmux-better-copy-buffer.sh choose" "TPM-sourced plugin binds prefix ="
+assert_contains "$choose_binding" "display-popup" "TPM-sourced plugin binds prefix = to TUI popup"
+assert_contains "$choose_binding" "TMUX_BCB_TARGET=#{pane_id}" "TPM-sourced plugin passes invoking pane to TUI popup"
+assert_contains "$choose_binding" "$plugin_dir/scripts/tui.py" "TPM-sourced plugin starts the Python TUI fast path"
+assert_not_contains "$choose_binding" "choose-tui" "TPM-sourced plugin avoids choose-tui on the hot startup path"
 assert_contains "$paste_binding" "$plugin_dir/scripts/tmux-better-copy-buffer.sh paste-latest" "TPM-sourced plugin binds prefix ]"
 
 tmux set-buffer -b buffer0001 'alpha'
