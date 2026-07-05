@@ -62,6 +62,7 @@ unset TMUX || true
 export HOME="$tmp/home"
 export XDG_CONFIG_HOME="$HOME/.config"
 export TMUX_TMPDIR="$tmp/t"
+export TMUX_PLUGIN_MANAGER_PATH="$HOME/.tmux/plugins"
 
 mkdir -p "$HOME/.tmux/plugins" "$XDG_CONFIG_HOME" "$TMUX_TMPDIR"
 git clone --depth 1 https://github.com/tmux-plugins/tpm "$HOME/.tmux/plugins/tpm" >/dev/null 2>&1 ||
@@ -81,10 +82,11 @@ tmux source-file "$HOME/.tmux.conf"
 
 plugin_name=$(plugin_name_from_spec "$PLUGIN_SPEC")
 plugin_source=${PLUGIN_SPEC%%#*}
+installed_plugin_dir="$HOME/.tmux/plugins/$plugin_name"
 if is_local_plugin_spec "$plugin_source"; then
   plugin_dir=$(CDPATH= cd -- "$plugin_source" && pwd)
 else
-  plugin_dir="$HOME/.tmux/plugins/$plugin_name"
+  plugin_dir="$installed_plugin_dir"
 fi
 
 [ -d "$plugin_dir" ] || fail "TPM installed plugin directory"
@@ -96,16 +98,35 @@ fi
 
 choose_binding=$(tmux list-keys -T prefix = 2>/dev/null || true)
 paste_binding=$(tmux list-keys -T prefix ']' 2>/dev/null || true)
+binding_plugin_dir=$plugin_dir
+binding_plugin_dir_from_binding=$(
+  printf '%s\n' "$choose_binding" |
+    tr ' ' '\n' |
+    sed -n 's|^\(/.*\)/scripts/tui\.py$|\1|p' |
+    sed -n '1p'
+)
+if [ "$binding_plugin_dir_from_binding" ]; then
+  binding_plugin_dir=$binding_plugin_dir_from_binding
+fi
+case "$choose_binding
+$paste_binding" in
+  *"$installed_plugin_dir/"*) binding_plugin_dir=$installed_plugin_dir ;;
+esac
+
+[ -d "$binding_plugin_dir" ] || fail "TPM runtime plugin directory"
+[ -f "$binding_plugin_dir/tmux-better-copy-buffer.tmux" ] || fail "TPM runtime plugin entrypoint"
+[ -x "$binding_plugin_dir/scripts/tmux-better-copy-buffer.sh" ] || fail "TPM runtime executable script"
+
 assert_contains "$choose_binding" "display-popup" "TPM-sourced plugin binds prefix = to TUI popup"
 assert_contains "$choose_binding" "TMUX_BCB_TARGET=#{pane_id}" "TPM-sourced plugin passes invoking pane to TUI popup"
-assert_contains "$choose_binding" "$plugin_dir/scripts/tui.py" "TPM-sourced plugin starts the Python TUI fast path"
+assert_contains "$choose_binding" "$binding_plugin_dir/scripts/tui.py" "TPM-sourced plugin starts the Python TUI fast path"
 assert_not_contains "$choose_binding" "choose-tui" "TPM-sourced plugin avoids choose-tui on the hot startup path"
-assert_contains "$paste_binding" "$plugin_dir/scripts/tmux-better-copy-buffer.sh paste-latest" "TPM-sourced plugin binds prefix ]"
+assert_contains "$paste_binding" "$binding_plugin_dir/scripts/tmux-better-copy-buffer.sh paste-latest" "TPM-sourced plugin binds prefix ]"
 
 tmux set-buffer -b buffer0001 'alpha'
 sleep 1
 tmux set-buffer -b buffer0002 'beta'
-"$plugin_dir/scripts/tmux-better-copy-buffer.sh" paste-touch buffer0001
+"$binding_plugin_dir/scripts/tmux-better-copy-buffer.sh" paste-touch buffer0001
 
 pane=$(tmux capture-pane -p -J | tr -d '\r')
 assert_contains "$pane" "alpha" "TPM-installed plugin pastes selected buffer"

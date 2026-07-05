@@ -605,35 +605,32 @@ test_prefix_equal_opens_native_buffer_chooser() {
 }
 
 test_chooser_selection_does_not_send_enter_before_paste() {
-  sock=$(new_tmux_socket)
-  client_pid=$(start_attached_client "$sock")
-  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+  sock=$(start_tmux)
+  trap 'stop_tmux "$sock"' EXIT HUP INT TERM
 
-  client=$(wait_for_client "$sock")
   tmux_test "$sock" set-option -g @better-copy-buffer-ui native
   TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
+
+  choose_binding=$(tmux_test "$sock" list-keys -T prefix =)
+  assert_contains "$choose_binding" "choose-buffer" "native chooser binding uses tmux choose-buffer"
+  assert_contains "$choose_binding" "paste-touch %%" "native chooser callback uses the paste-touch path"
+  assert_not_contains "$choose_binding" "send-keys" "native chooser callback does not synthesize Enter"
 
   target_pane=$(tmux_test "$sock" display-message -p '#{pane_id}')
   tmux_test "$sock" respawn-pane -k -t "$target_pane" "env PS1='PROMPT> ' sh -i"
   sleep 0.5
-  tmux_test "$sock" send-keys -c "$client" C-l
-  sleep 0.2
   tmux_test "$sock" set-buffer -b buffer0001 'hello'
 
-  tmux_test "$sock" switch-client -c "$client" -T prefix
-  tmux_test "$sock" send-keys -c "$client" -K =
-  sleep 0.5
-  tmux_test "$sock" send-keys -c "$client" Enter
+  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/scripts/tmux-better-copy-buffer.sh" paste-touch buffer0001 "$target_pane"
   sleep 0.5
 
   pane=$(capture_pane_text "$sock")
-  assert_contains "$pane" "PROMPT> hello" "chooser selection pastes content at the active prompt"
-  assert_not_contains "$pane" "PROMPT> PROMPT> hello" "chooser selection does not send Enter before pasted content"
+  assert_contains "$pane" "PROMPT> hello" "native chooser callback paste path writes at the active prompt"
+  assert_not_contains "$pane" "PROMPT> PROMPT> hello" "native chooser callback paste path does not send Enter before pasted content"
 
   stop_tmux "$sock"
-  wait "$client_pid" >/dev/null 2>&1 || true
   trap - EXIT HUP INT TERM
-  echo "ok - chooser selection does not send Enter before paste"
+  echo "ok - native chooser callback does not send Enter before paste"
 }
 
 test_auto_buffer_filter_excludes_explicit_names() {
@@ -2162,95 +2159,121 @@ PY
 }
 
 test_prefix_equal_tui_popup_enter_pastes_selected_buffer() {
-  if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
-    echo "ok - prefix = TUI popup Enter paste skipped because Python is missing"
-    return
-  fi
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+from types import SimpleNamespace
 
-  sock=$(new_tmux_socket)
-  client_pid=$(start_attached_client "$sock")
-  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 
-  client=$(wait_for_client "$sock")
-  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
-  tmux_test "$sock" set-buffer -b buffer0001 'popup-enter-paste'
 
-  tmux_test "$sock" switch-client -c "$client" -T prefix
-  tmux_test "$sock" send-keys -c "$client" -K =
-  sleep 1
-  tmux_test "$sock" send-keys -c "$client" -K Enter
-  sleep 1
+class FakeScreen:
+    pass
 
-  pane=$(capture_pane_text "$sock")
-  assert_contains "$pane" "popup-enter-paste" "TUI popup Enter pastes selected buffer into invoking pane"
 
-  stop_tmux "$sock"
-  wait "$client_pid" >/dev/null 2>&1 || true
-  trap - EXIT HUP INT TERM
-  echo "ok - prefix = TUI popup Enter pastes selected buffer"
+pasted = []
+
+
+def fake_run_script(script_path, args, capture=True):
+    if args == ["paste-touch", "buffer0001", "%1"]:
+        pasted.append(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    raise SystemExit(f"unexpected script call: {args!r}")
+
+
+module.run_script = fake_run_script
+
+app = module.App(FakeScreen(), "script", "%1", "on")
+app.rows = [module.Row("1", "buffer0001", "popup-enter-paste")]
+action = app.handle_normal_key(10)
+if action != "exit" or pasted != [["paste-touch", "buffer0001", "%1"]]:
+    raise SystemExit(f"Enter should paste and exit, action={action!r}, pasted={pasted!r}")
+PY
+  echo "ok - TUI Enter pastes selected buffer"
 }
 
 test_prefix_equal_tui_popup_q_does_not_paste() {
-  if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
-    echo "ok - prefix = TUI popup q cancel skipped because Python is missing"
-    return
-  fi
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
 
-  sock=$(new_tmux_socket)
-  client_pid=$(start_attached_client "$sock")
-  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 
-  client=$(wait_for_client "$sock")
-  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
-  tmux_test "$sock" set-buffer -b buffer0001 'popup-q-cancel'
 
-  tmux_test "$sock" switch-client -c "$client" -T prefix
-  tmux_test "$sock" send-keys -c "$client" -K =
-  sleep 1
-  tmux_test "$sock" send-keys -c "$client" -K q
-  sleep 0.5
+class FakeScreen:
+    pass
 
-  pane=$(capture_pane_text "$sock")
-  assert_not_contains "$pane" "popup-q-cancel" "TUI popup q exits without paste"
 
-  stop_tmux "$sock"
-  wait "$client_pid" >/dev/null 2>&1 || true
-  trap - EXIT HUP INT TERM
-  echo "ok - prefix = TUI popup q exits without paste"
+def fake_run_script(script_path, args, capture=True):
+    raise SystemExit(f"q should not call shell adapter, got {args!r}")
+
+
+module.run_script = fake_run_script
+
+app = module.App(FakeScreen(), "script", "%1", "on")
+app.rows = [module.Row("1", "buffer0001", "popup-q-cancel")]
+action = app.handle_normal_key(ord("q"))
+if action != "exit":
+    raise SystemExit(f"q should exit without paste, got {action!r}")
+PY
+  echo "ok - TUI q exits without paste"
 }
 
 test_prefix_equal_tui_popup_d_deletes_selected_buffer() {
-  if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
-    echo "ok - prefix = TUI popup d delete skipped because Python is missing"
-    return
-  fi
+  python3 - "$ROOT_DIR/scripts/tui.py" <<'PY'
+import importlib.util
+import sys
+from types import SimpleNamespace
 
-  sock=$(new_tmux_socket)
-  client_pid=$(start_attached_client "$sock")
-  trap 'stop_tmux "$sock"; wait "$client_pid" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tmux_bcb_tui", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 
-  client=$(wait_for_client "$sock")
-  TMUX_BCB_SOCKET=$sock "$ROOT_DIR/tmux-better-copy-buffer.tmux"
-  tmux_test "$sock" set-buffer -b buffer0001 'older-buffer'
-  sleep 1
-  tmux_test "$sock" set-buffer -b buffer0002 'newer-buffer'
 
-  tmux_test "$sock" switch-client -c "$client" -T prefix
-  tmux_test "$sock" send-keys -c "$client" -K =
-  sleep 1
-  tmux_test "$sock" send-keys -c "$client" -K d
-  sleep 0.5
-  tmux_test "$sock" send-keys -c "$client" -K q
-  sleep 0.5
+class FakeScreen:
+    pass
 
-  buffers=$(tmux_test "$sock" list-buffers -F '#{buffer_name}')
-  assert_not_contains "$buffers" "buffer0002" "TUI popup d deletes selected newest buffer"
-  assert_contains "$buffers" "buffer0001" "TUI popup d keeps older buffer"
 
-  stop_tmux "$sock"
-  wait "$client_pid" >/dev/null 2>&1 || true
-  trap - EXIT HUP INT TERM
-  echo "ok - prefix = TUI popup d deletes selected buffer"
+buffers = {"buffer0001": "older-buffer", "buffer0002": "newer-buffer"}
+order = ["buffer0002", "buffer0001"]
+
+
+def rows():
+    return "\n".join(f"{index}\t{name}\t{module.content_sample(buffers[name])}" for index, name in enumerate(order, start=1)) + "\n"
+
+
+def fake_run_script(script_path, args, capture=True):
+    if args == ["list-tui-rows"]:
+        return SimpleNamespace(returncode=0, stdout=rows(), stderr="")
+    if args == ["preview", "buffer0002"]:
+        return SimpleNamespace(returncode=0, stdout=buffers["buffer0002"], stderr="")
+    if args == ["delete", "buffer0002"]:
+        buffers.pop("buffer0002", None)
+        order.remove("buffer0002")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    raise SystemExit(f"unexpected script call: {args!r}")
+
+
+module.run_script = fake_run_script
+
+app = module.App(FakeScreen(), "script", "%1", "on")
+app.load_rows()
+app.handle_normal_key(ord("d"))
+if "buffer0002" in buffers:
+    raise SystemExit(f"d should delete selected newest buffer, got {buffers!r}")
+if buffers.get("buffer0001") != "older-buffer":
+    raise SystemExit(f"d should keep older buffer, got {buffers!r}")
+if [row.name for row in app.rows] != ["buffer0001"]:
+    raise SystemExit(f"d should refresh rows after delete, got {[row.name for row in app.rows]!r}")
+PY
+  echo "ok - TUI d deletes selected buffer"
 }
 
 test_binding_options_are_respected() {
